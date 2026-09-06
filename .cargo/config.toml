@@ -1,0 +1,3 @@
+[target.'cfg(all(windows, target_env = "msvc"))']
+# static CRT: no dependency on vcruntime140.dll / the Universal CRT update on Windows 7
+rustflags = ["-C", "target-feature=+crt-static"]
