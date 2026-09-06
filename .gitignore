@@ -1,0 +1,23 @@
+# build output
+/target
+/dist
+
+# IDE / editor state
+.idea/
+.vs/
+.vscode/
+*.iml
+*.swp
+*~
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# local logs and scratch
+*.log
+*.tmp
+
+# local notes and plans
+/internal
