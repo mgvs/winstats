@@ -1,4 +1,4 @@
-сдфыв# winstats
+# winstats
 
 System resource widgets in the style of [exelban/stats](https://github.com/exelban/stats), embedded directly into the
 Windows taskbar: the strip becomes a child of `Shell_TrayWnd` and is drawn with per-pixel alpha, so the taskbar
