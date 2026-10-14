@@ -48,6 +48,9 @@ pub struct Config {
     pub language: String,
     /// Network interfaces (by alias, e.g. "Wi-Fi") left out of the widget and the chart.
     pub net_disabled: Vec<String>,
+    /// Network speed display: "bytes" (B/s, binary prefixes) | "bits" (bps, decimal prefixes).
+    /// Applies to local and remote widgets and popups; other values use bytes.
+    pub net_unit: String,
     /// Physical disks (by model) left out of the widget and the chart.
     pub disks_disabled: Vec<String>,
     /// Series drawn in the network popup chart (clicking Download / Upload toggles them).
@@ -105,6 +108,7 @@ impl Default for Config {
             stretched: Vec::new(),
             language: "auto".into(),
             net_disabled: Vec::new(),
+            net_unit: "bytes".into(),
             disks_disabled: Vec::new(),
             net_chart_rx: true,
             net_chart_tx: true,
@@ -208,5 +212,28 @@ impl Config {
 
     pub fn accent_color(&self) -> crate::canvas::Color {
         crate::widgets::named_color(&self.accent).unwrap_or(crate::widgets::BLUE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_configs_default_to_byte_rates() {
+        let cfg: Config = toml::from_str("update_ms = 2000\nwidgets = [\"net\", \"disk\"]").unwrap();
+        assert_eq!(cfg.net_unit, "bytes");
+        assert_eq!(cfg.update_ms, 2000);
+        assert_eq!(cfg.widgets, vec!["net", "disk"]);
+    }
+
+    #[test]
+    fn network_units_survive_config_round_trip() {
+        for unit in ["bytes", "bits"] {
+            let cfg: Config = toml::from_str(&format!("net_unit = \"{unit}\"")).unwrap();
+            let saved = toml::to_string_pretty(&cfg).unwrap();
+            let loaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(loaded.net_unit, unit);
+        }
     }
 }

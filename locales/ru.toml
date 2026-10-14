@@ -18,6 +18,9 @@ chart = "График"
 battery = "Батарея"
 
 [menu]
+speed_units = "Единицы скорости"
+bytes_per_second = "Байты в секунду (B/s)"
+bits_per_second = "Биты в секунду (b/s)"
 colour = "Цвет"
 accent = "Акцентный"
 by_utilisation = "По загрузке"

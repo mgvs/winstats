@@ -3,7 +3,7 @@
 
 use crate::canvas::{Canvas, Color, FW_NORMAL, FW_SEMIBOLD, FontSpec, GREEN, RED, YELLOW};
 use crate::metrics::MetricsData;
-use crate::util::{format_bytes, format_bytes_rate, format_duration, pcwstr, wide};
+use crate::util::{format_bytes, format_bytes_rate, format_duration, format_net_rate, pcwstr, wide};
 use crate::i18n::{t, tf};
 use crate::widgets::{Kind, Theme};
 use std::time::Instant;
@@ -1234,16 +1234,18 @@ fn draw_net(ui: &mut Ui, m: &MetricsData) {
     ui.title_r(&head(m, "popup.network"), &sub(m, &line), &speed);
     // the Download / Upload rows switch their series in the chart on and off
     let (show_rx, show_tx) = (ui.t.net_rx, ui.t.net_tx);
+    let bits = ui.t.net_bits;
+    let rate = |v| format_net_rate(v, bits);
     let rx: Vec<f32> = if show_rx { m.net_history.iter().map(|v| v.0).collect() } else { Vec::new() };
     let tx: Vec<f32> = if show_tx { m.net_history.iter().map(|v| v.1).collect() } else { Vec::new() };
     let max = ui.chart2(&rx, &tx, 70.0, DOWN, UP, 10.0 * 1024.0);
     let (down, up) = (t("popup.download"), t("popup.upload"));
-    ui.legend(&[(&down, ui.on_off(DOWN, show_rx)), (&up, ui.on_off(UP, show_tx)), (&tf("popup.scale", &[("rate", &format_bytes_rate(max as f64))]), ui.t.dim.alpha(0.0))]);
+    ui.legend(&[(&down, ui.on_off(DOWN, show_rx)), (&up, ui.on_off(UP, show_tx)), (&tf("popup.scale", &[("rate", &rate(max as f64))]), ui.t.dim.alpha(0.0))]);
     let start = ui.y;
-    ui.row_lv(&down, &format_bytes_rate(m.net_rx), ui.on_off(ui.t.dim, show_rx), ui.on_off(DOWN, show_rx));
+    ui.row_lv(&down, &rate(m.net_rx), ui.on_off(ui.t.dim, show_rx), ui.on_off(DOWN, show_rx));
     ui.clickable(start, Action::ToggleNetSeries(true));
     let start = ui.y;
-    ui.row_lv(&up, &format_bytes_rate(m.net_tx), ui.on_off(ui.t.dim, show_tx), ui.on_off(UP, show_tx));
+    ui.row_lv(&up, &rate(m.net_tx), ui.on_off(ui.t.dim, show_tx), ui.on_off(UP, show_tx));
     ui.clickable(start, Action::ToggleNetSeries(false));
     if !m.net_ping_host.is_empty() {
         // ICMP probe to the configured host while the popup is open
@@ -1261,7 +1263,7 @@ fn draw_net(ui: &mut Ui, m: &MetricsData) {
             let start = ui.y;
             // hardware name (the Windows alias when an agent sends none)
             let name = if i.description.is_empty() { i.alias.clone() } else { i.description.clone() };
-            let value = if i.up { format!("{} / {}", format_bytes_rate(i.rx_bps), format_bytes_rate(i.tx_bps)) } else { t("popup.disconnected") };
+            let value = if i.up { format!("{} / {}", rate(i.rx_bps), rate(i.tx_bps)) } else { t("popup.disconnected") };
             let (lc, vc) = (ui.on_off(ui.t.text, i.enabled), ui.on_off(ui.t.text, i.enabled));
             ui.row_lv(&name, &value, lc, if i.up { vc } else { ui.on_off(ui.t.dim, i.enabled) });
             // one line each: IPv4 addresses (every one copies on click), MAC (copies), link speed

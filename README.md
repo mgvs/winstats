@@ -180,6 +180,7 @@ mode = "auto"           # auto | embedded | floating (see Supported systems)
 top_processes = 5       # rows in the popup process lists: 5 | 10 | 15 | 20
 language = "auto"       # "auto" = Windows display language, or a code from the list below
 net_disabled = []       # network adapters (by name, e.g. "Wi-Fi") left out of the widget and the chart
+net_unit = "bytes"      # "bytes" = B/s (1024-based), "bits" = b/s (1000-based)
 disks_disabled = []     # physical disks (by model) left out of the widget and the chart
 discovery = false       # listen for winstats-agent beacons (Remote machines menu)
 share = false           # serve this machine to other winstats on the network
@@ -188,6 +189,11 @@ share = false           # serve this machine to other winstats on the network
 cpu = "utilization"
 mem = "mono"
 ```
+
+Network > Speed units selects bytes per second (the default) or bits per second. The same setting can be written
+as `net_unit = "bits"` in the config. It applies to local and remote network widgets, popup download/upload and
+interface rates, and chart scale labels: for example, 125,000 bytes/s displays as `1.0 Mb/s`. Disk rates and
+transferred-byte totals keep their byte units. Unknown `net_unit` values fall back to bytes per second.
 
 Colour modes: `accent` draws charts in the accent colour and numbers in the plain text colour; `utilization` goes
 green / yellow / orange / red with the value (darker shades on a light taskbar so they stay readable); `mono` draws

@@ -18,6 +18,9 @@ chart = "Grafiek"
 battery = "Batterij"
 
 [menu]
+speed_units = "Snelheidseenheden"
+bytes_per_second = "Bytes per seconde (B/s)"
+bits_per_second = "Bits per seconde (b/s)"
 colour = "Kleur"
 accent = "Accent"
 by_utilisation = "Op belasting"

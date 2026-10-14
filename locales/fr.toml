@@ -18,6 +18,9 @@ chart = "Graphique"
 battery = "Batterie"
 
 [menu]
+speed_units = "Unités de vitesse"
+bytes_per_second = "Octets par seconde (B/s)"
+bits_per_second = "Bits par seconde (b/s)"
 colour = "Couleur"
 accent = "Accent"
 by_utilisation = "Selon la charge"

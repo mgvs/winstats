@@ -467,6 +467,7 @@ impl App {
             bar_w: widgets::bar_width_dip(&self.cfg.bar_width),
             net_rx: self.cfg.net_chart_rx,
             net_tx: self.cfg.net_chart_tx,
+            net_bits: self.cfg.net_unit == "bits",
             modes,
             label: None,
         }
@@ -1245,6 +1246,8 @@ const MENU_FONT_BASE: usize = 470;
 const MENU_CHART_BASE: usize = 480;
 const MENU_TOP_BASE: usize = 490;
 const MENU_BAR_BASE: usize = 500;
+const MENU_NET_BYTES: usize = 510;
+const MENU_NET_BITS: usize = 511;
 /// language: MENU_LANG_BASE = system language, then one entry per locale
 const MENU_LANG_BASE: usize = 600;
 /// Remote submenu: the discovery toggle, then one block of ids per listed agent
@@ -1460,6 +1463,12 @@ unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
             }
             if *kind == Kind::Cpu && hybrid {
                 menu_item(sub, MENU_GROUP_PE, &t("menu.group_pe_cores"), cfg.group_pe_cores);
+            }
+            if *kind == Kind::Net {
+                let units = CreatePopupMenu().ok()?;
+                menu_item(units, MENU_NET_BYTES, &t("menu.bytes_per_second"), cfg.net_unit != "bits");
+                menu_item(units, MENU_NET_BITS, &t("menu.bits_per_second"), cfg.net_unit == "bits");
+                menu_submenu(sub, units, &t("menu.speed_units"));
             }
             let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
             menu_item(sub, MENU_MOVE_BASE + mi * 2, &t("menu.move_left"), false);
@@ -1967,6 +1976,8 @@ impl App {
                 toggle(&mut self.cfg.stretched, widgets::CATALOG[c - MENU_STRETCH_BASE].1.to_string());
             }
             MENU_SPLIT_PE => self.cfg.split_pe_cores = !self.cfg.split_pe_cores,
+            MENU_NET_BYTES => self.cfg.net_unit = "bytes".into(),
+            MENU_NET_BITS => self.cfg.net_unit = "bits".into(),
             c if (MENU_MOVE_BASE..MENU_MOVE_BASE + widgets::MODULES.len() * 2).contains(&c) => {
                 let mi = (c - MENU_MOVE_BASE) / 2;
                 let dir = if (c - MENU_MOVE_BASE) % 2 == 0 { -1 } else { 1 };

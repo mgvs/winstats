@@ -18,6 +18,9 @@ chart = "Diagram"
 battery = "Batteri"
 
 [menu]
+speed_units = "Hastighetsenheter"
+bytes_per_second = "Byte per sekund (B/s)"
+bits_per_second = "Bit per sekund (b/s)"
 colour = "Färg"
 accent = "Accent"
 by_utilisation = "Efter belastning"

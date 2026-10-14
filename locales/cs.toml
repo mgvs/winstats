@@ -18,6 +18,9 @@ chart = "Graf"
 battery = "Baterie"
 
 [menu]
+speed_units = "Jednotky rychlosti"
+bytes_per_second = "Bajty za sekundu (B/s)"
+bits_per_second = "Bity za sekundu (b/s)"
 colour = "Barva"
 accent = "Akcent"
 by_utilisation = "Podle zátěže"

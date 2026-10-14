@@ -3,7 +3,7 @@
 
 use crate::canvas::{Canvas, Color, FontSpec, FW_NORMAL, FW_SEMIBOLD, usage_color, GREEN, RED, YELLOW};
 use crate::metrics::MetricsData;
-use crate::util::{format_bytes_rate, format_size};
+use crate::util::{format_bytes_rate, format_net_rate, format_size};
 
 /// How a module is coloured: accent, by utilisation, monochrome, or a fixed colour.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -52,6 +52,8 @@ pub struct Theme {
     /// series shown in the network popup chart
     pub net_rx: bool,
     pub net_tx: bool,
+    /// Show local and remote network speeds in bits per second.
+    pub net_bits: bool,
 }
 
 impl Theme {
@@ -612,14 +614,20 @@ fn pair_history(k: Kind, m: &MetricsData, t: &Theme) -> (Vec<f32>, Vec<f32>, Col
     }
 }
 
+impl Speed {
+    fn format_rate(&self, v: f64, t: &Theme) -> String {
+        if self.0 == Kind::Net { format_net_rate(v, t.net_bits) } else { format_bytes_rate(v) }
+    }
+}
+
 impl Widget for Speed {
     fn kind(&self) -> Kind {
         self.0
     }
     fn width(&self, c: &mut Canvas, t: &Theme, m: &MetricsData) -> i32 {
         let f = t.font(8.5, FW_NORMAL);
-        let reserve = c.measure_text("88.8 MB/s", f).0;
-        let cur = pair_now(self.0, m, t).iter().map(|(v, _)| c.measure_text(&format_bytes_rate(*v), f).0).max().unwrap_or(0);
+        let reserve = c.measure_text(if self.0 == Kind::Net && t.net_bits { "88.8 Mb/s" } else { "88.8 MB/s" }, f).0;
+        let cur = pair_now(self.0, m, t).iter().map(|(v, _)| c.measure_text(&self.format_rate(*v, t), f).0).max().unwrap_or(0);
         label_width(t) + t.s(4.0) + t.s(3.0) + reserve.max(cur)
     }
 
@@ -635,7 +643,7 @@ impl Widget for Speed {
             let cy = y as f32 + row_h * i as f32 + row_h / 2.0;
             let active = *v > 1024.0;
             c.fill_circle(x as f32 + dot_r, cy, dot_r, if active { *col } else { t.dim.alpha(0.35) });
-            let s = format_bytes_rate(*v);
+            let s = self.format_rate(*v, t);
             let (_, th) = c.measure_text(&s, f);
             c.draw_text(&s, text_x, (cy - th as f32 / 2.0).round() as i32, f, t.text);
         }

@@ -18,6 +18,9 @@ chart = "Grafik"
 battery = "Pil"
 
 [menu]
+speed_units = "Hız birimleri"
+bytes_per_second = "Saniye başına bayt (B/s)"
+bits_per_second = "Saniye başına bit (b/s)"
 colour = "Renk"
 accent = "Vurgu"
 by_utilisation = "Yüke göre"

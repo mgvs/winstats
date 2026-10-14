@@ -18,6 +18,9 @@ chart = "Grafiks"
 battery = "Akumulators"
 
 [menu]
+speed_units = "Ātruma mērvienības"
+bytes_per_second = "Baiti sekundē (B/s)"
+bits_per_second = "Biti sekundē (b/s)"
 colour = "Krāsa"
 accent = "Akcenta"
 by_utilisation = "Pēc noslodzes"

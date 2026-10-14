@@ -18,6 +18,9 @@ chart = "グラフ"
 battery = "バッテリー"
 
 [menu]
+speed_units = "速度の単位"
+bytes_per_second = "バイト毎秒 (B/s)"
+bits_per_second = "ビット毎秒 (b/s)"
 colour = "色"
 accent = "アクセント"
 by_utilisation = "負荷に応じて"

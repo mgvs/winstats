@@ -160,6 +160,62 @@ pub fn format_bytes_rate(bps: f64) -> String {
 }
 
 
+/// Metrics stay in bytes per second; only the network display converts to bits.
+pub fn format_net_rate(bytes_per_sec: f64, bits: bool) -> String {
+    if !bits {
+        return format_bytes_rate(bytes_per_sec);
+    }
+    let b = bytes_per_sec.max(0.0) * 8.0;
+    if b < 1_000.0 {
+        format!("{:.0} b/s", b)
+    } else if b < 1_000_000.0 {
+        format!("{:.0} Kb/s", b / 1_000.0)
+    } else if b < 1_000_000_000.0 {
+        format!("{:.1} Mb/s", b / 1_000_000.0)
+    } else {
+        format!("{:.2} Gb/s", b / 1_000_000_000.0)
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    #[test]
+    fn network_bits_use_decimal_units_and_convert_bytes() {
+        for (bytes, expected) in [
+            (-1.0, "0 b/s"),
+            (0.0, "0 b/s"),
+            (1.0, "8 b/s"),
+            (124.875, "999 b/s"),
+            (125.0, "1 Kb/s"),
+            (125_000.0 - 1.0, "1000 Kb/s"),
+            (125_000.0, "1.0 Mb/s"),
+            (1_250_000.0, "10.0 Mb/s"),
+            (125_000_000.0 - 1.0, "1000.0 Mb/s"),
+            (125_000_000.0, "1.00 Gb/s"),
+            (1_250_000_000.0, "10.00 Gb/s"),
+        ] {
+            assert_eq!(format_net_rate(bytes, true), expected, "{bytes} bytes/s");
+        }
+    }
+
+    #[test]
+    fn network_bytes_keep_existing_binary_units() {
+        for (bytes, expected) in [
+            (-1.0, "0 B/s"),
+            (0.0, "0 B/s"),
+            (1.0, "1 B/s"),
+            (1023.0, "1023 B/s"),
+            (1024.0, "1 KB/s"),
+            (1_048_576.0, "1.0 MB/s"),
+            (1_073_741_824.0, "1.00 GB/s"),
+        ] {
+            assert_eq!(format_net_rate(bytes, false), expected, "{bytes} bytes/s");
+        }
+    }
+}
+
 pub fn format_bytes(b: u64) -> String {
     let f = b as f64;
     const K: f64 = 1024.0;

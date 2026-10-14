@@ -18,6 +18,9 @@ chart = "Графикон"
 battery = "Батерија"
 
 [menu]
+speed_units = "Јединице брзине"
+bytes_per_second = "Бајтови у секунди (B/s)"
+bits_per_second = "Битови у секунди (b/s)"
 colour = "Боја"
 accent = "Акцентна"
 by_utilisation = "Према оптерећењу"

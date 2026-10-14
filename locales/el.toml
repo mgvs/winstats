@@ -18,6 +18,9 @@ chart = "Γράφημα"
 battery = "Μπαταρία"
 
 [menu]
+speed_units = "Μονάδες ταχύτητας"
+bytes_per_second = "Byte ανά δευτερόλεπτο (B/s)"
+bits_per_second = "Bit ανά δευτερόλεπτο (b/s)"
 colour = "Χρώμα"
 accent = "Έμφασης"
 by_utilisation = "Ανάλογα με τον φόρτο"

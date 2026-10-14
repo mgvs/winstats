@@ -19,6 +19,9 @@ chart = "Chart"
 battery = "Battery"
 
 [menu]
+speed_units = "Speed units"
+bytes_per_second = "Bytes per second (B/s)"
+bits_per_second = "Bits per second (b/s)"
 colour = "Colour"
 accent = "Accent"
 by_utilisation = "By utilisation"

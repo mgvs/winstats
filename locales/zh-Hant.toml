@@ -18,6 +18,9 @@ chart = "圖表"
 battery = "電池"
 
 [menu]
+speed_units = "速度單位"
+bytes_per_second = "位元組每秒 (B/s)"
+bits_per_second = "位元每秒 (b/s)"
 colour = "顏色"
 accent = "強調色"
 by_utilisation = "依負載"

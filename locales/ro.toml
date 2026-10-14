@@ -18,6 +18,9 @@ chart = "Grafic"
 battery = "Baterie"
 
 [menu]
+speed_units = "Unități de viteză"
+bytes_per_second = "Octeți pe secundă (B/s)"
+bits_per_second = "Biți pe secundă (b/s)"
 colour = "Culoare"
 accent = "Accent"
 by_utilisation = "După încărcare"
