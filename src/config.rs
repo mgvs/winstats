@@ -58,6 +58,10 @@ pub struct Config {
     /// Network speed display: "bytes" (B/s, binary prefixes) | "bits" (bps, decimal prefixes).
     /// Applies to local and remote widgets and popups; other values use bytes.
     pub net_unit: String,
+    /// Temperature display: "celsius" (°C) | "fahrenheit" (°F). Applies to the CPU, GPU and
+    /// disk temperatures in the popups, local and remote; other values use celsius. Sensors
+    /// and the remote protocol always speak Celsius; the conversion happens at display time.
+    pub temp_unit: String,
     /// Physical disks (by model) left out of the widget and the chart.
     pub disks_disabled: Vec<String>,
     /// Video adapters (by name) left out of the GPU load; the popup shows the first enabled one.
@@ -122,6 +126,7 @@ impl Default for Config {
             language: "auto".into(),
             net_disabled: Vec::new(),
             net_unit: "bytes".into(),
+            temp_unit: "celsius".into(),
             disks_disabled: Vec::new(),
             gpu_disabled: Vec::new(),
             net_chart_rx: true,
@@ -248,6 +253,23 @@ mod tests {
             let saved = toml::to_string_pretty(&cfg).unwrap();
             let loaded: Config = toml::from_str(&saved).unwrap();
             assert_eq!(loaded.net_unit, unit);
+        }
+    }
+
+    #[test]
+    fn old_configs_default_to_celsius() {
+        let cfg: Config = toml::from_str("update_ms = 2000\nwidgets = [\"cpu\", \"gpu\"]").unwrap();
+        assert_eq!(cfg.temp_unit, "celsius");
+        assert_eq!(cfg.update_ms, 2000);
+    }
+
+    #[test]
+    fn temperature_units_survive_config_round_trip() {
+        for unit in ["celsius", "fahrenheit"] {
+            let cfg: Config = toml::from_str(&format!("temp_unit = \"{unit}\"")).unwrap();
+            let saved = toml::to_string_pretty(&cfg).unwrap();
+            let loaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(loaded.temp_unit, unit);
         }
     }
 }

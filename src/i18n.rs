@@ -153,6 +153,19 @@ pub fn tf(key: &str, args: &[(&str, &str)]) -> String {
 mod tests {
     use super::*;
 
+    /// Every locale's hot-spot tooltip keeps both guidance-range placeholders, which the
+    /// code fills in the selected unit (they are differences, not readings).
+    #[test]
+    fn hotspot_tip_carries_both_placeholders_in_every_locale() {
+        for (code, _, text) in LOCALES {
+            let tip = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("hotspot_tip"))
+                .unwrap_or_else(|| panic!("{code} has no hotspot_tip"));
+            assert!(tip.contains("{gap}") && tip.contains("{big}"), "{code}");
+        }
+    }
+
     /// Every embedded locale parses and carries exactly the English key set with the same
     /// placeholders.
     #[test]

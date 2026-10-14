@@ -1210,6 +1210,26 @@ fn link_speed(bps: u64) -> String {
     }
 }
 
+/// A temperature in the configured unit. The sensors and the remote protocol always speak
+/// Celsius; the conversion happens here, at display time.
+fn fmt_temp(c: f32, fahrenheit: bool) -> String {
+    if fahrenheit {
+        format!("{:.0} \u{00B0}F", c * 9.0 / 5.0 + 32.0)
+    } else {
+        format!("{c:.0} \u{00B0}C")
+    }
+}
+
+/// A temperature difference (a guidance range, not a reading) in the configured unit.
+/// Differences scale by 9/5 and must not take the +32 offset.
+fn fmt_delta(lo: f32, hi: f32, fahrenheit: bool) -> String {
+    if fahrenheit {
+        format!("{:.0}-{:.0} \u{00B0}F", lo * 9.0 / 5.0, hi * 9.0 / 5.0)
+    } else {
+        format!("{lo:.0}-{hi:.0} \u{00B0}C")
+    }
+}
+
 fn pct(v: f32) -> String {
     format!("{}%", (v * 100.0).round() as i32)
 }
@@ -1279,7 +1299,7 @@ fn sub(m: &MetricsData, s: &str) -> String {
 
 fn draw_cpu(ui: &mut Ui, m: &MetricsData) {
     // the name on the left, the temperature (where known) on the right
-    let temp = m.cpu_temp.map(|c| format!("{c:.0} \u{00B0}C")).unwrap_or_default();
+    let temp = m.cpu_temp.map(|c| fmt_temp(c, ui.t.temp_f)).unwrap_or_default();
     if m.cpu_socket_names.len() > 1 && !m.offline {
         // several physical processors: each one under the title with its own load
         let lines: Vec<(String, String, Color, Option<Action>)> = m
@@ -1440,7 +1460,7 @@ fn draw_mem(ui: &mut Ui, m: &MetricsData) {
 }
 
 fn draw_gpu(ui: &mut Ui, m: &MetricsData) {
-    let temp = m.gpu_perf.temp.map(|c| format!("{c:.0} \u{00B0}C")).unwrap_or_default();
+    let temp = m.gpu_perf.temp.map(|c| fmt_temp(c, ui.t.temp_f)).unwrap_or_default();
     if m.gpu_adapters.is_empty() || m.offline {
         ui.title_r(&head(m, "popup.gpu"), &sub(m, &m.gpu_name), &temp);
     } else {
@@ -1492,8 +1512,18 @@ fn draw_gpu(ui: &mut Ui, m: &MetricsData) {
     if let Some(h) = p.hotspot {
         // the hottest point of the die; the tooltip says what the gap to the core reading means
         let start = ui.y;
-        ui.row(&t("popup.hotspot"), &format!("{h:.0} \u{00B0}C"));
-        ui.hover_tip(start, t("popup.hotspot_tip"));
+        ui.row(&t("popup.hotspot"), &fmt_temp(h, ui.t.temp_f));
+        // the guidance ranges follow the selected unit: they are differences, not readings
+        ui.hover_tip(
+            start,
+            tf(
+                "popup.hotspot_tip",
+                &[
+                    ("gap", &fmt_delta(5.0, 15.0, ui.t.temp_f)),
+                    ("big", &fmt_delta(20.0, 30.0, ui.t.temp_f)),
+                ],
+            ),
+        );
     }
     // the rest folds away under "More"
     let more = ui.expanded.contains("more:gpu");
@@ -1670,7 +1700,7 @@ fn draw_disk(ui: &mut Ui, m: &MetricsData) {
                 parts.push(format_bytes(d.size));
             }
             if let Some(c) = d.temp {
-                parts.push(format!("{c:.0} \u{00B0}C"));
+                parts.push(fmt_temp(c, ui.t.temp_f));
             }
             let desc = parts.join(" · ");
             let start = ui.y;
@@ -1770,5 +1800,33 @@ fn draw_battery(ui: &mut Ui, m: &MetricsData) {
         if d.max_mwh > 0 {
             ui.row(&t("popup.capacity"), &format!("{:.1} / {:.1} {}", d.remaining_mwh as f32 / 1000.0, d.max_mwh as f32 / 1000.0, unit("wh")));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fmt_delta, fmt_temp};
+
+    #[test]
+    fn fahrenheit_conversion_boundaries() {
+        assert_eq!(fmt_temp(0.0, true), "32 \u{00B0}F");
+        assert_eq!(fmt_temp(100.0, true), "212 \u{00B0}F");
+        assert_eq!(fmt_temp(-40.0, true), "-40 \u{00B0}F"); // the scales meet here
+        assert_eq!(fmt_temp(37.4, true), "99 \u{00B0}F"); // rounds like the Celsius display
+        assert_eq!(fmt_temp(37.6, true), "100 \u{00B0}F");
+    }
+
+    #[test]
+    fn celsius_display_keeps_the_unit_letter() {
+        assert_eq!(fmt_temp(38.4, false), "38 \u{00B0}C");
+    }
+
+    #[test]
+    fn guidance_differences_scale_without_the_offset() {
+        // differences take 9/5 only: an offset would show 32-41 here, not 0-9
+        assert_eq!(fmt_delta(0.0, 5.0, true), "0-9 \u{00B0}F");
+        assert_eq!(fmt_delta(5.0, 15.0, true), "9-27 \u{00B0}F");
+        assert_eq!(fmt_delta(20.0, 30.0, true), "36-54 \u{00B0}F");
+        assert_eq!(fmt_delta(5.0, 15.0, false), "5-15 \u{00B0}C");
     }
 }

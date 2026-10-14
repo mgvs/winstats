@@ -54,6 +54,8 @@ pub struct Theme {
     pub net_tx: bool,
     /// Show local and remote network speeds in bits per second.
     pub net_bits: bool,
+    /// Show local and remote temperatures in Fahrenheit.
+    pub temp_f: bool,
 }
 
 impl Theme {

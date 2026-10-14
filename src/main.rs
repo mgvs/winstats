@@ -499,6 +499,7 @@ impl App {
             net_rx: self.cfg.net_chart_rx,
             net_tx: self.cfg.net_chart_tx,
             net_bits: self.cfg.net_unit == "bits",
+            temp_f: self.cfg.temp_unit == "fahrenheit",
             modes,
             label: None,
         }
@@ -1294,6 +1295,8 @@ const MENU_TOP_BASE: usize = 490;
 const MENU_BAR_BASE: usize = 500;
 const MENU_NET_BYTES: usize = 510;
 const MENU_NET_BITS: usize = 511;
+const MENU_TEMP_CELSIUS: usize = 512;
+const MENU_TEMP_FAHRENHEIT: usize = 513;
 /// language: MENU_LANG_BASE = system language, then one entry per locale
 const MENU_LANG_BASE: usize = 600;
 /// Remote submenu: the discovery toggle, then one block of ids per listed agent
@@ -1602,6 +1605,10 @@ unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
             menu_item(opacity, MENU_OPACITY_BASE + i, &t(key), cfg.popup_opacity == *value);
         }
         menu_submenu(settings, opacity, &t("menu.popup_opacity"));
+        let temps = CreatePopupMenu().ok()?;
+        menu_item(temps, MENU_TEMP_CELSIUS, &t("menu.celsius"), cfg.temp_unit != "fahrenheit");
+        menu_item(temps, MENU_TEMP_FAHRENHEIT, &t("menu.fahrenheit"), cfg.temp_unit == "fahrenheit");
+        menu_submenu(settings, temps, &t("menu.temp_units"));
 
         let lang = CreatePopupMenu().ok()?;
         menu_item(lang, MENU_LANG_BASE, &t("menu.lang_system"), cfg.language == "auto");
@@ -2067,6 +2074,8 @@ impl App {
             MENU_SPLIT_PE => self.cfg.split_pe_cores = !self.cfg.split_pe_cores,
             MENU_NET_BYTES => self.cfg.net_unit = "bytes".into(),
             MENU_NET_BITS => self.cfg.net_unit = "bits".into(),
+            MENU_TEMP_CELSIUS => self.cfg.temp_unit = "celsius".into(),
+            MENU_TEMP_FAHRENHEIT => self.cfg.temp_unit = "fahrenheit".into(),
             c if (MENU_MOVE_BASE..MENU_MOVE_BASE + widgets::MODULES.len() * 2).contains(&c) => {
                 let mi = (c - MENU_MOVE_BASE) / 2;
                 let dir = if (c - MENU_MOVE_BASE) % 2 == 0 { -1 } else { 1 };
