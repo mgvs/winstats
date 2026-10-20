@@ -4,6 +4,7 @@ mod canvas;
 mod config;
 mod diag;
 mod i18n;
+mod input;
 mod menu;
 mod metrics;
 mod about;
@@ -28,7 +29,7 @@ use util::{pcwstr, wide};
 use windows::Win32::UI::Controls::{
     TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
 };
-use i18n::t;
+use i18n::{t, tf};
 use widgets::{ColorMode, Kind, Theme, Widget};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -1420,6 +1421,8 @@ const RM_COLOR_STRIDE: usize = 16;
 const RM_SPLIT_PE: usize = 4;
 const RM_GROUP_PE: usize = 5;
 const RM_LABELS: usize = 6;
+/// opens the dialog that edits the machine's label
+const RM_EDIT_LABEL: usize = 7;
 /// + CATALOG index: stretch that chart of the machine (vertical taskbar)
 const RM_STRETCH: usize = 140;
 const TOP_COUNTS: &[u32] = &[5, 8, 10, 15, 20];
@@ -1529,6 +1532,7 @@ unsafe fn remote_menu(cfg: &Config, entries: &[RemoteEntry], dpi: u32, vertical:
                     }
                     let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
                     menu_item(sub, base + RM_LABELS, &t("menu.labels"), rc.map_or(true, |r| r.labels));
+                    menu_item(sub, base + RM_EDIT_LABEL, &t("menu.edit_label"), false);
                     menu_item(sub, base + RM_LEFT, &t("menu.move_left"), false);
                     menu_item(sub, base + RM_RIGHT, &t("menu.move_right"), false);
                     let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
@@ -1837,7 +1841,7 @@ fn menu_sticky(id: u32) -> bool {
     let id = id as usize;
     match id {
         MENU_EXIT | MENU_CONFIG | MENU_RELOAD | MENU_TASKMGR | MENU_ABOUT | MENU_CHECK_UPDATE | MENU_GET_UPDATE => false,
-        c if c >= MENU_REMOTE_BASE => !matches!((c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE, RM_CONNECT | RM_FORGET),
+        c if c >= MENU_REMOTE_BASE => !matches!((c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE, RM_CONNECT | RM_FORGET | RM_EDIT_LABEL),
         _ => true,
     }
 }
@@ -1882,10 +1886,54 @@ fn menu_command(cmd: u32) {
                 log!("autostart change failed");
             }
         }
+        // the label dialog runs its own message loop: outside `with_app`, so the strip keeps ticking
+        c if c >= MENU_REMOTE_BASE && (c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE == RM_EDIT_LABEL => {
+            edit_remote_label((c - MENU_REMOTE_BASE) / MENU_REMOTE_STRIDE);
+        }
         other => {
             with_app(|app| app.apply_menu(other));
         }
     }
+}
+
+/// Three letters from a machine name, the label a newly connected machine starts with.
+fn default_label(name: &str) -> String {
+    name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect::<String>().to_uppercase()
+}
+
+/// Ask for a new label for the machine in entry `entry` of the Remote submenu; an empty answer
+/// brings back the default one.
+fn edit_remote_label(entry: usize) {
+    let Some((key, name, current, dpi, above)) = with_app(|app| {
+        app.popup.hide("label");
+        let key = app.menu_remote.get(entry)?.key.clone()?;
+        let rc = app.cfg.remotes.get(&key)?;
+        let current = if rc.label.is_empty() { default_label(&rc.name) } else { rc.label.clone() };
+        let dpi = app.taskbar.as_ref().map(|t| t.dpi()).unwrap_or(96);
+        // just above the strip, under the pointer
+        let mut pt = POINT::default();
+        let mut bar = RECT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+            let _ = GetWindowRect(app.bar, &mut bar);
+        }
+        Some((key, rc.name.clone(), current, dpi, POINT { x: pt.x, y: bar.top.min(pt.y) }))
+    })
+    .flatten() else {
+        return;
+    };
+    let caption = tf("dialog.label_title", &[("name", &name)]);
+    let Some(text) = input::prompt(&caption, &t("dialog.label_prompt"), &current, 3, dpi, above, &t("dialog.ok"), &t("dialog.cancel")) else {
+        return;
+    };
+    with_app(|app| {
+        if let Some(rc) = app.cfg.remotes.get_mut(&key) {
+            let text = text.trim();
+            rc.label = if text.is_empty() { default_label(&rc.name) } else { text.chars().take(3).collect() };
+        }
+        app.cfg.save();
+        app.render();
+    });
 }
 
 fn show_menu() {
@@ -2094,7 +2142,7 @@ impl App {
             (None, RM_CONNECT) => {
                 // first connection: a config entry named after the machine
                 let key = remote::key_for(&e.name, &self.cfg.remotes);
-                let label: String = e.name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect::<String>().to_uppercase();
+                let label = default_label(&e.name);
                 self.cfg.remotes.insert(
                     key.clone(),
                     config::RemoteCfg { id: e.id.clone(), name: e.name.clone(), address: e.address.clone(), enabled: true, label, ..Default::default() },
