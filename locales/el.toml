@@ -18,6 +18,7 @@ chart = "Γράφημα"
 battery = "Μπαταρία"
 
 [menu]
+upload_first = "Πρώτα αποστολή"
 speed_units = "Μονάδες ταχύτητας"
 bytes_per_second = "Byte ανά δευτερόλεπτο (B/s)"
 bits_per_second = "Bit ανά δευτερόλεπτο (b/s)"

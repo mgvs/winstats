@@ -18,6 +18,7 @@ chart = "Graafik"
 battery = "Aku"
 
 [menu]
+upload_first = "Üleslaadimine esimesena"
 speed_units = "Kiiruse ühikud"
 bytes_per_second = "Baiti sekundis (B/s)"
 bits_per_second = "Bitti sekundis (b/s)"

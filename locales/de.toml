@@ -18,6 +18,7 @@ chart = "Diagramm"
 battery = "Akku"
 
 [menu]
+upload_first = "Upload zuerst"
 speed_units = "Geschwindigkeitseinheiten"
 bytes_per_second = "Bytes pro Sekunde (B/s)"
 bits_per_second = "Bits pro Sekunde (b/s)"

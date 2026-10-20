@@ -18,6 +18,7 @@ chart = "Графикон"
 battery = "Батерија"
 
 [menu]
+upload_first = "Прво отпремање"
 speed_units = "Јединице брзине"
 bytes_per_second = "Бајтови у секунди (B/s)"
 bits_per_second = "Битови у секунди (b/s)"

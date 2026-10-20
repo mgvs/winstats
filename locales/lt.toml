@@ -18,6 +18,7 @@ chart = "Grafikas"
 battery = "Baterija"
 
 [menu]
+upload_first = "Pirmiausia išsiuntimas"
 speed_units = "Spartos vienetai"
 bytes_per_second = "Baitai per sekundę (B/s)"
 bits_per_second = "Bitai per sekundę (b/s)"

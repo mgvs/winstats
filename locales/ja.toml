@@ -18,6 +18,7 @@ chart = "グラフ"
 battery = "バッテリー"
 
 [menu]
+upload_first = "アップロードを上に表示"
 speed_units = "速度の単位"
 bytes_per_second = "バイト毎秒 (B/s)"
 bits_per_second = "ビット毎秒 (b/s)"

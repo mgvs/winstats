@@ -18,6 +18,7 @@ chart = "Графік"
 battery = "Батарея"
 
 [menu]
+upload_first = "Спочатку надсилання"
 speed_units = "Одиниці швидкості"
 bytes_per_second = "Байти за секунду (B/s)"
 bits_per_second = "Біти за секунду (b/s)"

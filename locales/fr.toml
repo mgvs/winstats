@@ -18,6 +18,7 @@ chart = "Graphique"
 battery = "Batterie"
 
 [menu]
+upload_first = "Envoi en premier"
 speed_units = "Unités de vitesse"
 bytes_per_second = "Octets par seconde (B/s)"
 bits_per_second = "Bits par seconde (b/s)"

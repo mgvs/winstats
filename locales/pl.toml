@@ -18,6 +18,7 @@ chart = "Wykres"
 battery = "Bateria"
 
 [menu]
+upload_first = "Wysyłanie na górze"
 speed_units = "Jednostki prędkości"
 bytes_per_second = "Bajty na sekundę (B/s)"
 bits_per_second = "Bity na sekundę (b/s)"

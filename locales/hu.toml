@@ -18,6 +18,7 @@ chart = "Diagram"
 battery = "Akkumulátor"
 
 [menu]
+upload_first = "Feltöltés felül"
 speed_units = "Sebesség mértékegysége"
 bytes_per_second = "Bájt másodpercenként (B/s)"
 bits_per_second = "Bit másodpercenként (b/s)"

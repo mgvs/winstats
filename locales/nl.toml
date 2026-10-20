@@ -18,6 +18,7 @@ chart = "Grafiek"
 battery = "Batterij"
 
 [menu]
+upload_first = "Upload eerst"
 speed_units = "Snelheidseenheden"
 bytes_per_second = "Bytes per seconde (B/s)"
 bits_per_second = "Bits per seconde (b/s)"

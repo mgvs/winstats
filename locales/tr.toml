@@ -18,6 +18,7 @@ chart = "Grafik"
 battery = "Pil"
 
 [menu]
+upload_first = "Önce yükleme"
 speed_units = "Hız birimleri"
 bytes_per_second = "Saniye başına bayt (B/s)"
 bits_per_second = "Saniye başına bit (b/s)"

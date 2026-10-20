@@ -18,6 +18,7 @@ chart = "图表"
 battery = "电池"
 
 [menu]
+upload_first = "上行在上"
 speed_units = "速度单位"
 bytes_per_second = "字节每秒 (B/s)"
 bits_per_second = "比特每秒 (b/s)"

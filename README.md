@@ -183,6 +183,7 @@ top_processes = 5       # rows in the popup process lists: 5 | 10 | 15 | 20
 language = "auto"       # "auto" = Windows display language, or a code from the list below
 net_disabled = []       # network adapters (by name, e.g. "Wi-Fi") left out of the widget and the chart
 net_unit = "bytes"      # "bytes" = B/s (1024-based), "bits" = b/s (1000-based)
+net_upload_first = false # true = upload on top, download below in network speed widgets
 temp_unit = "celsius"   # "celsius" = °C, "fahrenheit" = °F
 disks_disabled = []     # physical disks (by model) left out of the widget and the chart
 discovery = false       # listen for winstats-agent beacons (Remote machines menu)

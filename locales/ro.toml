@@ -18,6 +18,7 @@ chart = "Grafic"
 battery = "Baterie"
 
 [menu]
+upload_first = "Încărcare mai întâi"
 speed_units = "Unități de viteză"
 bytes_per_second = "Octeți pe secundă (B/s)"
 bits_per_second = "Biți pe secundă (b/s)"

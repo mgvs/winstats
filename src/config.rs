@@ -58,6 +58,8 @@ pub struct Config {
     /// Network speed display: "bytes" (B/s, binary prefixes) | "bits" (bps, decimal prefixes).
     /// Applies to local and remote widgets and popups; other values use bytes.
     pub net_unit: String,
+    /// Put upload above download in local and remote network speed widgets.
+    pub net_upload_first: bool,
     /// Temperature display: "celsius" (°C) | "fahrenheit" (°F). Applies to the CPU, GPU and
     /// disk temperatures in the popups, local and remote; other values use celsius. Sensors
     /// and the remote protocol always speak Celsius; the conversion happens at display time.
@@ -126,6 +128,7 @@ impl Default for Config {
             language: "auto".into(),
             net_disabled: Vec::new(),
             net_unit: "bytes".into(),
+            net_upload_first: false,
             temp_unit: "celsius".into(),
             disks_disabled: Vec::new(),
             gpu_disabled: Vec::new(),
@@ -242,6 +245,7 @@ mod tests {
     fn old_configs_default_to_byte_rates() {
         let cfg: Config = toml::from_str("update_ms = 2000\nwidgets = [\"net\", \"disk\"]").unwrap();
         assert_eq!(cfg.net_unit, "bytes");
+        assert!(!cfg.net_upload_first);
         assert_eq!(cfg.update_ms, 2000);
         assert_eq!(cfg.widgets, vec!["net", "disk"]);
     }
@@ -253,6 +257,15 @@ mod tests {
             let saved = toml::to_string_pretty(&cfg).unwrap();
             let loaded: Config = toml::from_str(&saved).unwrap();
             assert_eq!(loaded.net_unit, unit);
+        }
+    }
+
+    #[test]
+    fn network_speed_order_survives_config_round_trip() {
+        for upload_first in [false, true] {
+            let cfg: Config = toml::from_str(&format!("net_upload_first = {upload_first}")).unwrap();
+            let loaded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+            assert_eq!(loaded.net_upload_first, upload_first);
         }
     }
 

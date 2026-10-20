@@ -54,6 +54,8 @@ pub struct Theme {
     pub net_tx: bool,
     /// Show local and remote network speeds in bits per second.
     pub net_bits: bool,
+    /// Put upload above download in the two-row network speed widget.
+    pub net_upload_first: bool,
     /// Show local and remote temperatures in Fahrenheit.
     pub temp_f: bool,
 }
@@ -592,6 +594,7 @@ fn pair_now(k: Kind, m: &MetricsData, t: &Theme) -> [(f64, Color); 2] {
     let (a, b) = pair_colors(k, t);
     match k {
         Kind::Disk => [(m.disk_read, a), (m.disk_write, b)],
+        Kind::Net if t.net_upload_first => [(m.net_tx, b), (m.net_rx, a)],
         _ => [(m.net_rx, a), (m.net_tx, b)],
     }
 }
@@ -613,6 +616,49 @@ fn pair_history(k: Kind, m: &MetricsData, t: &Theme) -> (Vec<f32>, Vec<f32>, Col
             b,
             10.0 * 1024.0,
         ),
+    }
+}
+
+#[cfg(test)]
+mod speed_order_tests {
+    use super::*;
+    use crate::canvas::WHITE;
+
+    fn theme(mode: ColorMode) -> Theme {
+        Theme {
+            text: WHITE, dim: Color::rgb(128, 128, 128), accent: BLUE,
+            light: false, scale: 1.0, inner_h: 24, labels: true, font_scale: 1.0,
+            split_pe: true, chart_w: 34.0, bar_w: 3.0, modes: [mode; 6], label: None,
+            net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false,
+        }
+    }
+
+    #[test]
+    fn network_order_keeps_values_with_their_direction_colours() {
+        let m = MetricsData { net_rx: 8192.0, net_tx: 4096.0, ..Default::default() };
+        let fixed = Color::rgb(64, 192, 128);
+        for (mode, down, up) in [
+            (ColorMode::Accent, DOWN, UP),
+            (ColorMode::Utilization, DOWN, UP),
+            (ColorMode::Mono, WHITE, Color::rgb(128, 128, 128)),
+            (ColorMode::Fixed(fixed), fixed, UP),
+        ] {
+            let mut t = theme(mode);
+            assert_eq!(pair_now(Kind::Net, &m, &t), [(8192.0, down), (4096.0, up)]);
+            t.net_upload_first = true;
+            assert_eq!(pair_now(Kind::Net, &m, &t), [(4096.0, up), (8192.0, down)]);
+        }
+    }
+
+    #[test]
+    fn upload_first_leaves_disks_and_network_chart_series_unchanged() {
+        let mut m = MetricsData { disk_read: 16384.0, disk_write: 2048.0, ..Default::default() };
+        m.net_history.push_back((8192.0, 4096.0));
+        let mut t = theme(ColorMode::Accent);
+        let history = pair_history(Kind::Net, &m, &t);
+        t.net_upload_first = true;
+        assert_eq!(pair_now(Kind::Disk, &m, &t), [(16384.0, READ), (2048.0, WRITE)]);
+        assert_eq!(pair_history(Kind::Net, &m, &t), history);
     }
 }
 

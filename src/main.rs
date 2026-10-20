@@ -499,6 +499,7 @@ impl App {
             net_rx: self.cfg.net_chart_rx,
             net_tx: self.cfg.net_chart_tx,
             net_bits: self.cfg.net_unit == "bits",
+            net_upload_first: self.cfg.net_upload_first,
             temp_f: self.cfg.temp_unit == "fahrenheit",
             modes,
             label: None,
@@ -1298,6 +1299,7 @@ const MENU_NET_BYTES: usize = 510;
 const MENU_NET_BITS: usize = 511;
 const MENU_TEMP_CELSIUS: usize = 512;
 const MENU_TEMP_FAHRENHEIT: usize = 513;
+const MENU_NET_UPLOAD_FIRST: usize = 514;
 /// language: MENU_LANG_BASE = system language, then one entry per locale
 const MENU_LANG_BASE: usize = 600;
 /// Remote submenu: the discovery toggle, then one block of ids per listed agent
@@ -1519,6 +1521,7 @@ unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
                 menu_item(units, MENU_NET_BYTES, &t("menu.bytes_per_second"), cfg.net_unit != "bits");
                 menu_item(units, MENU_NET_BITS, &t("menu.bits_per_second"), cfg.net_unit == "bits");
                 menu_submenu(sub, units, &t("menu.speed_units"));
+                menu_item(sub, MENU_NET_UPLOAD_FIRST, &t("menu.upload_first"), cfg.net_upload_first);
             }
             let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
             menu_item(sub, MENU_MOVE_BASE + mi * 2, &t("menu.move_left"), false);
@@ -2075,6 +2078,7 @@ impl App {
             MENU_SPLIT_PE => self.cfg.split_pe_cores = !self.cfg.split_pe_cores,
             MENU_NET_BYTES => self.cfg.net_unit = "bytes".into(),
             MENU_NET_BITS => self.cfg.net_unit = "bits".into(),
+            MENU_NET_UPLOAD_FIRST => self.cfg.net_upload_first = !self.cfg.net_upload_first,
             MENU_TEMP_CELSIUS => self.cfg.temp_unit = "celsius".into(),
             MENU_TEMP_FAHRENHEIT => self.cfg.temp_unit = "fahrenheit".into(),
             c if (MENU_MOVE_BASE..MENU_MOVE_BASE + widgets::MODULES.len() * 2).contains(&c) => {
