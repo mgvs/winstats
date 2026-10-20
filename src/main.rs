@@ -25,6 +25,9 @@ use about::About;
 use popup::Popup;
 use taskbar::Taskbar;
 use util::{pcwstr, wide};
+use windows::Win32::UI::Controls::{
+    TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+};
 use i18n::t;
 use widgets::{ColorMode, Kind, Theme, Widget};
 use windows::Win32::Foundation::*;
@@ -80,6 +83,11 @@ struct App {
     /// newer release found by the update check, shown in the menu
     update_available: Option<String>,
     remotes: remote::Remotes,
+    /// tooltip window naming the widget under the mouse ("node4-rk1: GPU")
+    tips: HWND,
+    /// the strip window and the (rect, text) per widget the tooltip's tools were made for
+    tip_bar: HWND,
+    tip_items: Vec<(RECT, String)>,
     /// ICMP probe for the latency rows of the network popup
     ping: metrics::ping::Ping,
     /// this machine served to other winstats (Remote > Share this machine)
@@ -318,6 +326,9 @@ fn main() {
             about,
             update_available: None,
             remotes: remote::Remotes::new(),
+            tips: HWND::default(),
+            tip_bar: HWND::default(),
+            tip_items: Vec::new(),
             ping: metrics::ping::Ping::new(&cfg.ping_host),
             share: None,
             menu_remote: Vec::new(),
@@ -743,6 +754,7 @@ impl App {
         if self.ticks == 1 {
             log!("placed bar at {:?}", rc);
         }
+        self.update_tips(vertical);
         if let Err(e) = self.canvas.present(self.bar) {
             if self.ticks % 30 == 1 {
                 log!("UpdateLayeredWindow failed: {e}");
@@ -780,6 +792,96 @@ impl App {
         } else {
             (POINT { x: pt.x, y: rc.bottom }, TPM_LEFTALIGN | TPM_TOPALIGN)
         }
+    }
+
+    /// Hover names for the placed widgets: the module, and for a remote machine its name first
+    /// ("node4-rk1: GPU", with "offline" while it does not answer). One tooltip tool per widget;
+    /// the tools are rebuilt only when the set of widgets changes, otherwise their rectangles and
+    /// texts are updated in place so a tip that is showing stays up.
+    fn update_tips(&mut self, vertical: bool) {
+        let items: Vec<(RECT, String)> = self
+            .layout
+            .iter()
+            .map(|(i, kind, p0, p1, q0, q1)| {
+                let rect = if vertical {
+                    RECT { left: *q0, top: *p0, right: *q1, bottom: *p1 }
+                } else {
+                    RECT { left: *p0, top: *q0, right: *p1, bottom: *q1 }
+                };
+                let text = match self.widgets.get(*i).and_then(|w| w.source()) {
+                    None => kind.title(),
+                    Some(key) => {
+                        let name = self.cfg.remotes.get(key).map(|r| r.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| key.to_string());
+                        let stale = self.remotes.agents.get(key).map_or(true, |a| a.stale);
+                        let mut s = format!("{name}: {}", kind.title());
+                        if stale {
+                            s.push_str(&format!(" \u{00B7} {}", t("remote.offline")));
+                        }
+                        s
+                    }
+                };
+                (rect, text)
+            })
+            .collect();
+        let rebuild = self.tip_bar != self.bar || self.tip_items.len() != items.len() || !unsafe { IsWindow(self.tips).as_bool() };
+        if !rebuild && self.tip_items == items {
+            return;
+        }
+        let tool = |uid: usize, rect: RECT, text: &mut Vec<u16>, bar: HWND| TTTOOLINFOW {
+            // the v2 size (without lpReserved): accepted by comctl32 5 and 6
+            cbSize: (std::mem::size_of::<TTTOOLINFOW>() - std::mem::size_of::<usize>()) as u32,
+            uFlags: TTF_SUBCLASS,
+            hwnd: bar,
+            uId: uid,
+            rect,
+            hinst: HINSTANCE::default(),
+            lpszText: windows::core::PWSTR(text.as_mut_ptr()),
+            lParam: LPARAM(0),
+            lpReserved: std::ptr::null_mut(),
+        };
+        unsafe {
+            if rebuild {
+                if IsWindow(self.tips).as_bool() {
+                    let _ = DestroyWindow(self.tips);
+                }
+                let hinstance: HINSTANCE = GetModuleHandleW(None).map(|h| h.into()).unwrap_or_default();
+                // owned by the hidden top-level window: the strip itself is a child of Explorer's
+                // taskbar; ALWAYSTIP because the taskbar is never the active window
+                self.tips = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                    TOOLTIPS_CLASSW,
+                    PCWSTR::null(),
+                    WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP | TTS_NOPREFIX),
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    self.hidden,
+                    None,
+                    hinstance,
+                    None,
+                )
+                .unwrap_or_default();
+                for (uid, (rect, text)) in items.iter().enumerate() {
+                    let mut w = wide(text);
+                    let ti = tool(uid, *rect, &mut w, self.bar);
+                    SendMessageW(self.tips, TTM_ADDTOOLW, WPARAM(0), LPARAM(&ti as *const _ as isize));
+                }
+            } else {
+                for (uid, ((rect, text), (old_rect, old_text))) in items.iter().zip(self.tip_items.iter()).enumerate() {
+                    let mut w = wide(text);
+                    let ti = tool(uid, *rect, &mut w, self.bar);
+                    if rect != old_rect {
+                        SendMessageW(self.tips, TTM_NEWTOOLRECTW, WPARAM(0), LPARAM(&ti as *const _ as isize));
+                    }
+                    if text != old_text {
+                        SendMessageW(self.tips, TTM_UPDATETIPTEXTW, WPARAM(0), LPARAM(&ti as *const _ as isize));
+                    }
+                }
+            }
+        }
+        self.tip_bar = self.bar;
+        self.tip_items = items;
     }
 
     /// Bar-client (x, y) as (position along the strip, position across it).
