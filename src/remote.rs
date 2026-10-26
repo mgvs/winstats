@@ -20,7 +20,8 @@ use crate::metrics::{self, battery::{Battery, BatteryDetail}, gpu::AdapterInfo, 
 /// No data for this long: the machine's widgets turn grey.
 pub const STALE_SECS: f64 = 10.0;
 /// No data for this long: the machine's widgets leave the strip (they come back with the data).
-pub const GONE_SECS: f64 = 30.0;
+/// Long enough to ride out a Wi-Fi roam or a router hiccup and the reconnect after it.
+pub const GONE_SECS: f64 = 120.0;
 
 /// An agent heard on the network.
 #[derive(Clone, Debug)]
@@ -135,10 +136,15 @@ impl Drop for Link {
 fn link_thread(addr: String, token: String, state: Arc<Mutex<LinkState>>, stop: Arc<AtomicBool>) {
     let mut backoff = 1u64;
     while !stop.load(Ordering::Relaxed) {
-        match session(&addr, &token, &state, &stop) {
-            Ok(()) => backoff = 1,
-            Err(_) => state.lock().unwrap().status = Status::Offline,
+        let started = Instant::now();
+        let _ = session(&addr, &token, &state, &stop);
+        let mut s = state.lock().unwrap();
+        s.status = Status::Offline;
+        // a session that received data was a working link: the next drop retries quickly again
+        if s.last_rx.map_or(false, |t| t >= started) {
+            backoff = 1;
         }
+        drop(s);
         // wait out the backoff in small steps so a drop stops the thread quickly
         let until = Instant::now() + Duration::from_secs(backoff);
         while Instant::now() < until && !stop.load(Ordering::Relaxed) {

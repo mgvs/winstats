@@ -267,7 +267,7 @@ How it fits together:
 - **Identity.** A machine is remembered by the id its agent generated on first start, not by its name or address, so
   a renamed or re-addressed box picks up its widgets, its place in the strip and its colours when it reappears.
   When a machine stops answering its widgets keep their last values, turn grey after 10 seconds and leave the strip
-  after 30 seconds; the order is kept and they come back with the first new data.
+  after 2 minutes; the order is kept and they come back with the first new data.
 
 ### Setting it up
 
