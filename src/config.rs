@@ -23,6 +23,10 @@ pub struct Config {
     pub disk: String,
     /// Accent colour: palette name ("system", "blue", "green", ...) or hex like "#2E7CF6".
     pub accent: String,
+    /// Box outlines and labels of the widgets, for a light and a dark taskbar: palette name or
+    /// "#RRGGBB"; empty = the theme's grey.
+    pub outline_light: String,
+    pub outline_dark: String,
     /// Per-module colour mode: module (cpu, gpu, mem, disk, net) -> "accent" | "utilization" | "mono" | palette name | hex.
     pub colors: BTreeMap<String, String>,
     /// Force theme: "auto" | "dark" | "light"
@@ -110,6 +114,8 @@ impl Default for Config {
             utilization_colors: false,
             disk: "C:".into(),
             accent: "blue".into(),
+            outline_light: String::new(),
+            outline_dark: String::new(),
             colors: BTreeMap::new(),
             theme: "auto".into(),
             popup_opacity: "system".into(),
@@ -157,7 +163,7 @@ pub struct RemoteCfg {
     /// "host:port"; learned from the beacon, or typed in for machines discovery cannot reach
     pub address: String,
     pub enabled: bool,
-    /// vertical label next to this machine's widgets (up to 3 characters)
+    /// vertical label next to this machine's widgets (up to 4 characters)
     pub label: String,
     pub token: String,
     /// colour mode per module, like `colors`

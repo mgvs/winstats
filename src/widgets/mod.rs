@@ -33,6 +33,8 @@ pub struct Theme {
     pub text: Color,
     pub dim: Color,
     pub accent: Color,
+    /// box outlines and labels; None = derived from `dim`
+    pub outline: Option<Color>,
     pub light: bool,
     pub scale: f32,
     pub inner_h: i32,
@@ -61,6 +63,14 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// Box outlines around bars and charts.
+    pub fn stroke(&self) -> Color {
+        self.outline.unwrap_or(self.dim.alpha(0.7))
+    }
+    /// Labels next to and above the values.
+    pub fn caption(&self) -> Color {
+        self.outline.unwrap_or(self.dim)
+    }
     /// DIP -> physical pixels
     pub fn s(&self, dip: f32) -> i32 {
         (dip * self.scale).round().max(1.0) as i32
@@ -77,7 +87,7 @@ impl Theme {
     /// Vertical label of a widget: the machine's label for remote widgets, the module's otherwise.
     pub fn label(&self, k: Kind) -> String {
         match &self.label {
-            Some(l) if !l.is_empty() => l.chars().take(3).collect::<String>().to_uppercase(),
+            Some(l) if !l.is_empty() => l.chars().take(LABEL_MAX).collect::<String>().to_uppercase(),
             _ => short_label(k).to_string(),
         }
     }
@@ -388,25 +398,28 @@ pub fn build(names: &[String]) -> Vec<Box<dyn Widget>> {
 // ---------------------------------------------------------------- label column
 
 const LABEL_DIP: f32 = 6.0;
+/// Longest vertical label: a machine's label can have this many characters.
+pub const LABEL_MAX: usize = 4;
 
 pub fn label_width(t: &Theme) -> i32 {
     if t.labels { t.s(LABEL_DIP) + t.s(2.0) } else { 0 }
 }
 
-/// Three letters stacked vertically in a narrow column.
+/// Up to `LABEL_MAX` letters stacked vertically in a narrow column.
 fn draw_label(c: &mut Canvas, x: i32, y: i32, t: &Theme, label: &str) {
     if !t.labels {
         return;
     }
-    let f = t.font_fixed(6.5, FW_SEMIBOLD);
-    let chars: Vec<char> = label.chars().take(3).collect();
+    let chars: Vec<char> = label.chars().take(LABEL_MAX).collect();
+    // four letters share the column height: a touch smaller so they do not touch
+    let f = t.font_fixed(if chars.len() > 3 { 6.0 } else { 6.5 }, FW_SEMIBOLD);
     let slot = t.inner_h as f32 / chars.len().max(1) as f32;
     for (i, ch) in chars.iter().enumerate() {
         let s = ch.to_string();
         let (w, h) = c.measure_text(&s, f);
         let cx = x + (t.s(LABEL_DIP) - w) / 2;
         let cy = y + (slot * i as f32 + (slot - h as f32) / 2.0).round() as i32;
-        c.draw_text(&s, cx, cy, f, t.dim);
+        c.draw_text(&s, cx, cy, f, t.caption());
     }
 }
 
@@ -478,7 +491,7 @@ impl Widget for CpuBars {
         let n = m.cpu_cores.len().max(1);
         let (bw, gap, pad) = bar_geometry(t, n);
         let box_w = self.width(c, t, m) - label_width(t);
-        c.stroke_round_rect(x, y, box_w, t.inner_h, t.dim.alpha(0.7));
+        c.stroke_round_rect(x, y, box_w, t.inner_h, t.stroke());
         let bottom = y + t.inner_h - 1 - pad;
         let max_h = (t.inner_h - 2 - pad * 2) as f32;
         let top_class = m.cpu_classes.iter().cloned().max().unwrap_or(0);
@@ -520,7 +533,7 @@ impl Widget for Line {
         draw_label(c, x, y, t, &t.label(self.0));
         let x = x + label_width(t);
         let w = t.s(t.chart_w);
-        c.stroke_round_rect(x, y, w, t.inner_h, t.dim.alpha(0.7));
+        c.stroke_round_rect(x, y, w, t.inner_h, t.stroke());
         let vals = history(self.0, m);
         let col = t.chart_color(self.0, vals.last().cloned().unwrap_or(0.0));
         c.line_chart(x + 1, y + 1, w - 2, t.inner_h - 2, &vals, col, col.alpha(0.35));
@@ -562,7 +575,7 @@ impl Widget for Mini {
         let (vw, vh) = c.measure_text(&text, vf);
         let total = lh + vh - t.s(2.0);
         let top = y + (t.inner_h - total) / 2;
-        c.draw_text(&label, x + (w - lw) / 2, top, lf, t.dim);
+        c.draw_text(&label, x + (w - lw) / 2, top, lf, t.caption());
         let col = match v {
             Some(v) => t.value_color(self.0, v),
             None => t.dim,
@@ -626,7 +639,7 @@ mod speed_order_tests {
 
     fn theme(mode: ColorMode) -> Theme {
         Theme {
-            text: WHITE, dim: Color::rgb(128, 128, 128), accent: BLUE,
+            text: WHITE, dim: Color::rgb(128, 128, 128), accent: BLUE, outline: None,
             light: false, scale: 1.0, inner_h: 24, labels: true, font_scale: 1.0,
             split_pe: true, chart_w: 34.0, bar_w: 3.0, modes: [mode; 6], label: None,
             net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false,
@@ -754,7 +767,7 @@ impl Widget for DualChart {
         draw_label(c, x, y, t, &t.label(self.0));
         let x = x + label_width(t);
         let w = t.s(t.chart_w);
-        c.stroke_round_rect(x, y, w, t.inner_h, t.dim.alpha(0.7));
+        c.stroke_round_rect(x, y, w, t.inner_h, t.stroke());
         let (a, b, ca, cb, floor) = pair_history(self.0, m, t);
         let max = a.iter().chain(b.iter()).cloned().fold(floor, f32::max);
         let na: Vec<f32> = a.iter().map(|v| v / max).collect();
@@ -790,8 +803,8 @@ impl Widget for BatteryWidget {
         let bw = t.s(20.0);
         let bh = t.s(10.0);
         let by = y + (t.inner_h - bh) / 2;
-        c.stroke_round_rect(bx, by, bw, bh, t.dim);
-        c.fill_rect(bx + bw, by + bh / 2 - t.s(1.5), t.s(1.5), t.s(3.0), t.dim); // nub
+        c.stroke_round_rect(bx, by, bw, bh, t.caption());
+        c.fill_rect(bx + bw, by + bh / 2 - t.s(1.5), t.s(1.5), t.s(3.0), t.caption()); // nub
         let fill_col = if b.charging || b.on_ac {
             GREEN
         } else if b.level < 0.15 {

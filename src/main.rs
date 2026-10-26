@@ -187,6 +187,7 @@ fn agent_theme(cfg: &Config, base: &Theme, key: &str, stale: bool) -> Theme {
     let mut t = remote_theme(cfg, base, key);
     if stale {
         let grey = base.dim.alpha(0.6);
+        t.outline = None;
         t.modes = [ColorMode::Fixed(grey); 6];
         t.accent = grey;
         t.text = grey;
@@ -500,6 +501,7 @@ impl App {
             dim,
             // a colour too close to the background (white on light, black on dark) is shifted
             accent: widgets::readable(self.cfg.accent_color(), light),
+            outline: widgets::named_color(if light { &self.cfg.outline_light } else { &self.cfg.outline_dark }),
             light,
             scale,
             inner_h: ((h as f32) * 0.55).round() as i32,
@@ -1394,6 +1396,9 @@ const MENU_COLOR_BASE: usize = 300;
 const MENU_COLOR_STRIDE: usize = 20;
 /// global accent: MENU_ACCENT_BASE + palette index
 const MENU_ACCENT_BASE: usize = 450;
+/// outline colour for the current (light or dark) strip: MENU_OUTLINE_BASE = the theme's grey,
+/// then one entry per palette colour
+const MENU_OUTLINE_BASE: usize = 660;
 const MENU_FONT_BASE: usize = 470;
 const MENU_CHART_BASE: usize = 480;
 const MENU_TOP_BASE: usize = 490;
@@ -1592,8 +1597,8 @@ unsafe fn menu_submenu_ex(menu: HMENU, sub: HMENU, text: &str, enabled: bool) {
 
 /// Settings menu: one submenu per module with a checkable entry per widget type.
 unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
-    let MenuState { cfg, hybrid, splittable, gpu_ok, battery_ok, update, remotes, dpi, vertical, .. } = st;
-    let (hybrid, splittable, gpu_ok, battery_ok, dpi, vertical) = (*hybrid, *splittable, *gpu_ok, *battery_ok, *dpi, *vertical);
+    let MenuState { cfg, hybrid, splittable, gpu_ok, battery_ok, update, remotes, dpi, vertical, light, .. } = st;
+    let (hybrid, splittable, gpu_ok, battery_ok, dpi, vertical, light) = (*hybrid, *splittable, *gpu_ok, *battery_ok, *dpi, *vertical, *light);
     let update = update.as_deref();
     let remotes: &[RemoteEntry] = remotes;
     unsafe {
@@ -1662,6 +1667,15 @@ unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
             menu_color_item(accent, MENU_ACCENT_BASE + i, &t(title), cfg.accent == *name, palette_color(name, *c), dpi);
         }
         menu_submenu(settings, accent, &t("menu.accent_colour"));
+
+        // the strip's current look (light or dark taskbar) gets its own outline colour
+        let outline = CreatePopupMenu().ok()?;
+        let current = if light { &cfg.outline_light } else { &cfg.outline_dark };
+        menu_item(outline, MENU_OUTLINE_BASE, &t("menu.outline_default"), current.is_empty());
+        for (i, (name, title, c)) in widgets::PALETTE.iter().enumerate().skip(1) {
+            menu_color_item(outline, MENU_OUTLINE_BASE + i, &t(title), current == name, Some(*c), dpi);
+        }
+        menu_submenu(settings, outline, &t("menu.outline_colour"));
 
         let font = CreatePopupMenu().ok()?;
         for (i, (scale, title)) in FONT_SIZES.iter().enumerate() {
@@ -1808,6 +1822,8 @@ struct MenuState {
     dpi: u32,
     /// the taskbar is docked at a side: the vertical-layout items are shown
     vertical: bool,
+    /// the strip is drawn for a light taskbar: the outline colour item edits `outline_light`
+    light: bool,
     /// where the menu opens and which corner of it sits there (see `App::menu_anchor`)
     anchor: POINT,
     align: TRACK_POPUP_MENU_FLAGS,
@@ -1830,6 +1846,7 @@ fn menu_state(fresh: bool) -> Option<MenuState> {
             remotes,
             dpi: app.taskbar.as_ref().map(|t| t.dpi()).or_else(|| util::dpi_for_window(app.hidden)).unwrap_or(96),
             vertical: app.taskbar.as_ref().map_or(false, |t| t.vertical()),
+            light: app.strip_light(),
             anchor: app.menu_anchor().0,
             align: app.menu_anchor().1,
         }
@@ -1897,6 +1914,9 @@ fn menu_command(cmd: u32) {
 }
 
 /// Three letters from a machine name, the label a newly connected machine starts with.
+/// Longest label the dialog accepts.
+const LABEL_MAX: usize = widgets::LABEL_MAX;
+
 fn default_label(name: &str) -> String {
     name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect::<String>().to_uppercase()
 }
@@ -1923,13 +1943,13 @@ fn edit_remote_label(entry: usize) {
         return;
     };
     let caption = tf("dialog.label_title", &[("name", &name)]);
-    let Some(text) = input::prompt(&caption, &t("dialog.label_prompt"), &current, 3, dpi, above, &t("dialog.ok"), &t("dialog.cancel")) else {
+    let Some(text) = input::prompt(&caption, &t("dialog.label_prompt"), &current, LABEL_MAX, dpi, above, &t("dialog.ok"), &t("dialog.cancel")) else {
         return;
     };
     with_app(|app| {
         if let Some(rc) = app.cfg.remotes.get_mut(&key) {
             let text = text.trim();
-            rc.label = if text.is_empty() { default_label(&rc.name) } else { text.chars().take(3).collect() };
+            rc.label = if text.is_empty() { default_label(&rc.name) } else { text.chars().take(LABEL_MAX).collect() };
         }
         app.cfg.save();
         app.render();
@@ -2256,6 +2276,14 @@ impl App {
             }
             c if (MENU_FONT_BASE..MENU_FONT_BASE + FONT_SIZES.len()).contains(&c) => {
                 self.cfg.font_scale = FONT_SIZES[c - MENU_FONT_BASE].0;
+            }
+            c if (MENU_OUTLINE_BASE..MENU_OUTLINE_BASE + widgets::PALETTE.len()).contains(&c) => {
+                let value = if c == MENU_OUTLINE_BASE { String::new() } else { widgets::PALETTE[c - MENU_OUTLINE_BASE].0.to_string() };
+                if self.strip_light() {
+                    self.cfg.outline_light = value;
+                } else {
+                    self.cfg.outline_dark = value;
+                }
             }
             c if (MENU_ACCENT_BASE..MENU_ACCENT_BASE + widgets::PALETTE.len()).contains(&c) => {
                 self.cfg.accent = widgets::PALETTE[c - MENU_ACCENT_BASE].0.to_string();

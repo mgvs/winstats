@@ -172,6 +172,8 @@ labels = true           # vertical CPU / NET / DSK labels like in Stats
 stretched = []          # vertical taskbar: charts that fill the rest of their row ("cpu_line", "pi4/net_chart")
 disk = "C:"
 accent = "blue"         # palette name, "system" (Windows accent colour) or "#RRGGBB"
+outline_light = ""      # box outlines and labels on a light taskbar: palette name or "#RRGGBB", "" = grey
+outline_dark = ""       # the same on a dark taskbar
 theme = "auto"          # auto | dark | light
 font_scale = 1.0        # widget text size: 0.85 | 1.0 | 1.15 | 1.3
 group_pe_cores = false  # show P-cores first, then E-cores
@@ -282,8 +284,8 @@ How it fits together:
    the CPU temperature, the load average, the GPU's clock and sensors, the fans and the power draw when the agent
    reports them, and the process lists from that machine (the GPU one where the agent can tell, see below).
 
-The vertical label next to a remote widget is the machine's `label` (three letters, derived from its name; edit it
-in the config). Toggling interfaces and disks in the popups works the same way and is stored per machine.
+The vertical label next to a remote widget is the machine's `label` (up to four characters, by default three derived
+from its name; change it with *Edit label…* in the machine's submenu or in the config). Toggling interfaces and disks in the popups works the same way and is stored per machine.
 
 ### The agent
 
