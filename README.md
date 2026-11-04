@@ -74,6 +74,10 @@ Grab `winstats.exe` (x64), `winstats-x86.exe` (x86) or `winstats-arm64.exe` (ARM
 single executable. The same page has `winstats-agent-<version>.zip` with the agent for the other machines you want to
 watch (see Remote machines).
 
+Every release also has `SHA256SUMS.txt` with the SHA-256 of each file. To check a download, run
+`sha256sum -c SHA256SUMS.txt --ignore-missing` next to it (Git Bash, Linux, macOS has `shasum -a 256 -c`), or compare
+the file with `Get-FileHash winstats.exe` in PowerShell.
+
 ## Supported systems
 
 | Windows | x64 | x86 | ARM64 | notes |
