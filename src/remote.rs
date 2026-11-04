@@ -27,8 +27,23 @@ pub const GONE_SECS: f64 = 120.0;
 #[derive(Clone, Debug)]
 pub struct Seen {
     pub beacon: Beacon,
+    /// where the last beacon came from
     pub addr: SocketAddr,
     pub at: Instant,
+    /// every address the agent beacons from (one per interface on the network), last heard
+    heard: Vec<(SocketAddr, Instant)>,
+}
+
+impl Seen {
+    /// The agent was heard from this address within `BEACON_TIMEOUT_SECS`.
+    fn heard_from(&self, addr: &str) -> bool {
+        self.heard.iter().any(|(a, t)| t.elapsed().as_secs() < BEACON_TIMEOUT_SECS && a.to_string() == addr)
+    }
+
+    /// The most recently heard address other than `addr`.
+    fn other_than(&self, addr: &str) -> Option<SocketAddr> {
+        self.heard.iter().filter(|(a, t)| t.elapsed().as_secs() < BEACON_TIMEOUT_SECS && a.to_string() != addr).max_by_key(|(_, t)| *t).map(|(a, _)| *a)
+    }
 }
 
 /// Beacon listener.
@@ -64,7 +79,12 @@ impl Discovery {
                             continue;
                         }
                         let addr = SocketAddr::new(from.ip(), b.port);
-                        seen.lock().unwrap().insert(b.id.clone(), Seen { beacon: b, addr, at: Instant::now() });
+                        let now = Instant::now();
+                        let mut seen = seen.lock().unwrap();
+                        let mut heard = seen.remove(&b.id).map(|s| s.heard).unwrap_or_default();
+                        heard.retain(|(a, t)| *a != addr && t.elapsed().as_secs() < BEACON_TIMEOUT_SECS);
+                        heard.push((addr, now));
+                        seen.insert(b.id.clone(), Seen { beacon: b, addr, at: now, heard });
                     }
                 })
                 .ok()?;
@@ -104,6 +124,8 @@ struct LinkState {
     /// number of process rows the UI wants; taken by the writer thread
     want_details: Option<usize>,
     last_rx: Option<Instant>,
+    /// the agent said it is shutting down: its widgets leave the strip until data comes again
+    gone: bool,
 }
 
 /// One TCP session with an agent, reconnecting with backoff until dropped.
@@ -115,7 +137,7 @@ pub struct Link {
 
 impl Link {
     fn start(addr: String, token: String) -> Link {
-        let state = Arc::new(Mutex::new(LinkState { status: Status::Connecting, frames: VecDeque::new(), want_details: None, last_rx: None }));
+        let state = Arc::new(Mutex::new(LinkState { status: Status::Connecting, frames: VecDeque::new(), want_details: None, last_rx: None, gone: false }));
         let stop = Arc::new(AtomicBool::new(false));
         {
             let state = state.clone();
@@ -196,7 +218,12 @@ fn session(addr: &str, token: &str, state: &Arc<Mutex<LinkState>>, stop: &Arc<At
             break Ok(());
         }
         match read_frame(&mut reader) {
-            Ok(Frame::Bye { reason }) => break Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, reason)),
+            Ok(Frame::Bye { reason }) => {
+                if reason == BYE_SHUTDOWN {
+                    state.lock().unwrap().gone = true;
+                }
+                break Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, reason));
+            }
             Ok(Frame::Pong) => {
                 state.lock().unwrap().last_rx = Some(Instant::now());
             }
@@ -204,6 +231,7 @@ fn session(addr: &str, token: &str, state: &Arc<Mutex<LinkState>>, stop: &Arc<At
                 let mut s = state.lock().unwrap();
                 s.status = Status::Online;
                 s.last_rx = Some(Instant::now());
+                s.gone = false;
                 if s.frames.len() > 200 {
                     s.frames.pop_front();
                 }
@@ -225,6 +253,8 @@ pub struct Agent {
     pub info: Option<Info>,
     pub data: MetricsData,
     pub online: bool,
+    /// when the address last changed (see `Remotes::poll`)
+    addr_since: Instant,
     /// still drawn: data arrived within `GONE_SECS`
     pub visible: bool,
     /// drawn in grey: no data for `STALE_SECS`, not yet gone
@@ -260,6 +290,7 @@ impl Agent {
             visible: false,
             stale: false,
             offline_since: None,
+            addr_since: Instant::now(),
             net_disabled: cfg.net_disabled.clone(),
             disks_disabled: cfg.disks_disabled.clone(),
             last_sample: None,
@@ -674,11 +705,23 @@ impl Remotes {
         // drop agents that left the config
         self.agents.retain(|k, _| cfg.remotes.contains_key(k));
         for (key, rc) in cfg.remotes.iter_mut() {
-            // learn the address from the beacon
+            let agent = self.agents.entry(key.clone()).or_insert_with(|| Agent::new(key, rc));
+            // learn the address from the beacons. A machine with several interfaces on the network
+            // (Wi-Fi and a cable) beacons from each of them: the address in use stays while the
+            // machine is heard there, so the link is not restarted with every beacon; another one
+            // is tried when the link fails, at most every STALE_SECS
             if let Some(seen) = self.discovery.as_ref().and_then(|d| d.by_id(&rc.id)) {
-                let addr = seen.addr.to_string();
-                if rc.address != addr {
-                    rc.address = addr;
+                let failing = agent.link.as_ref().map_or(false, |l| l.state.lock().unwrap().status == Status::Offline);
+                let next = if !seen.heard_from(&rc.address) {
+                    Some(seen.addr)
+                } else if failing && agent.addr_since.elapsed().as_secs_f64() >= STALE_SECS {
+                    seen.other_than(&rc.address)
+                } else {
+                    None
+                };
+                if let Some(addr) = next {
+                    rc.address = addr.to_string();
+                    agent.addr_since = Instant::now();
                     changed = true;
                 }
                 if rc.name != seen.beacon.name {
@@ -686,7 +729,6 @@ impl Remotes {
                     changed = true;
                 }
             }
-            let agent = self.agents.entry(key.clone()).or_insert_with(|| Agent::new(key, rc));
             let want_link = rc.enabled && !rc.address.is_empty();
             match (&agent.link, want_link) {
                 (Some(l), true) if l.addr == rc.address => {}
@@ -698,11 +740,13 @@ impl Remotes {
             let mut status = Status::Offline;
             // seconds since the last frame; None = nothing received on this link yet
             let mut silence: Option<f64> = None;
+            let mut gone = false;
             if let Some(l) = &agent.link {
                 let mut s = l.state.lock().unwrap();
                 frames.extend(s.frames.drain(..));
                 status = s.status;
                 silence = s.last_rx.map(|t| t.elapsed().as_secs_f64());
+                gone = s.gone;
             }
             for f in frames {
                 match f {
@@ -713,10 +757,11 @@ impl Remotes {
                 }
             }
             // a machine that stops answering fades: its widgets stay in colour for STALE_SECS,
-            // then turn grey, and leave the strip after GONE_SECS without data
+            // then turn grey, and leave the strip after GONE_SECS without data; one that said it
+            // is shutting down leaves at once
             let quiet = silence.unwrap_or(f64::MAX);
-            let online = status == Status::Online && quiet < STALE_SECS;
-            agent.visible = quiet < GONE_SECS;
+            let online = !gone && status == Status::Online && quiet < STALE_SECS;
+            agent.visible = !gone && quiet < GONE_SECS;
             agent.stale = agent.visible && !online;
             if agent.online && !online {
                 agent.offline_since = Some(Instant::now());

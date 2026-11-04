@@ -480,7 +480,8 @@ pub enum Frame {
     Details(Details),
     Ping,
     Pong,
-    /// the agent refuses the session (bad token, unsupported version)
+    /// the agent refuses the session (bad token, unsupported version) or is going away
+    /// (`BYE_SHUTDOWN`)
     Bye {
         reason: String,
     },
@@ -500,6 +501,10 @@ pub fn open_beacon_socket(ifaces: &[Ipv4Addr]) -> io::Result<UdpSocket> {
 }
 
 /// Length-prefixed JSON frame.
+/// `Bye` reason of an agent that is going away (stopped, shutting down, rebooting): masters drop
+/// its widgets at once instead of waiting for the silence to time out.
+pub const BYE_SHUTDOWN: &str = "shutdown";
+
 pub fn write_frame<W: Write>(w: &mut W, frame: &Frame) -> io::Result<()> {
     let body = serde_json::to_vec(frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     w.write_all(&(body.len() as u32).to_le_bytes())?;

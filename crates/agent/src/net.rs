@@ -72,6 +72,77 @@ pub fn beacon_loop(shared: Arc<Shared>) {
     }
 }
 
+/// Tell every connected master that this agent is going away, so it drops the widgets at once.
+fn goodbye(shared: &Shared) {
+    for w in shared.clients.lock().unwrap().iter() {
+        let _ = write_frame(&mut *w.lock().unwrap(), &Frame::Bye { reason: BYE_SHUTDOWN.into() });
+    }
+}
+
+/// The signals that stop the agent: SIGTERM (systemd and launchd stopping it, shutdown,
+/// reboot), SIGINT and SIGHUP from a terminal.
+#[cfg(unix)]
+fn exit_signals() -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaddset(&mut set, s);
+        }
+        set
+    }
+}
+
+/// Block the stop signals in this thread and every thread started after it; `exit_with_goodbye`
+/// takes them with `sigwait`, so the goodbye runs as ordinary code, not in a signal handler.
+#[cfg(unix)]
+pub fn block_exit_signals() {
+    let set = exit_signals();
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+#[cfg(unix)]
+pub fn exit_with_goodbye(shared: Arc<Shared>) {
+    std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            let set = exit_signals();
+            let mut sig = 0;
+            unsafe {
+                libc::sigwait(&set, &mut sig);
+            }
+            goodbye(&shared);
+            std::process::exit(0);
+        })
+        .expect("signal thread");
+}
+
+/// Ctrl+C, closing the console, logging off and shutting down Windows.
+#[cfg(windows)]
+pub fn exit_with_goodbye(shared: Arc<Shared>) {
+    use std::sync::OnceLock;
+    static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+    unsafe extern "system" fn handler(_event: u32) -> i32 {
+        if let Some(s) = SHARED.get() {
+            goodbye(s);
+        }
+        std::process::exit(0)
+    }
+    let _ = SHARED.set(shared);
+    unsafe {
+        SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn exit_with_goodbye(_shared: Arc<Shared>) {}
+
 pub fn serve(shared: Arc<Shared>) {
     let addr = format!("{}:{}", shared.cfg.bind, shared.cfg.port);
     let listener = match TcpListener::bind(&addr) {
@@ -106,6 +177,8 @@ fn client(stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
     let peer = stream.peer_addr()?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(PING_INTERVAL_SECS * 6)))?;
+    // a master that stops reading must not hold up the goodbye
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let writer = Arc::new(Mutex::new(BufWriter::new(stream)));
 
@@ -129,6 +202,7 @@ fn client(stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
     }
     let info = shared.info.lock().unwrap().clone();
     write_frame(&mut *writer.lock().unwrap(), &Frame::Info(info.clone()))?;
+    shared.clients.lock().unwrap().push(writer.clone());
 
     // writer: every new sample goes out; stops when the reader has closed the socket
     let alive = Arc::new(Mutex::new(true));
@@ -187,6 +261,7 @@ fn client(stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
     };
     *alive.lock().unwrap() = false;
     shared.changed.notify_all();
+    shared.clients.lock().unwrap().retain(|w| !Arc::ptr_eq(w, &writer));
     eprintln!("{peer}: disconnected");
     result
 }

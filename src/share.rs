@@ -24,6 +24,8 @@ struct Inner {
     token: String,
     port: u16,
     stop: AtomicBool,
+    /// writers of the connected masters, for the goodbye when sharing stops
+    clients: Mutex<Vec<Arc<Mutex<BufWriter<TcpStream>>>>>,
 }
 
 pub struct Share {
@@ -35,6 +37,11 @@ pub struct Share {
 
 impl Drop for Share {
     fn drop(&mut self) {
+        // sharing turned off, winstats closing or Windows shutting down: the masters drop this
+        // machine's widgets at once
+        for w in self.inner.clients.lock().unwrap().iter() {
+            let _ = write_frame(&mut *w.lock().unwrap(), &Frame::Bye { reason: BYE_SHUTDOWN.into() });
+        }
         self.inner.stop.store(true, Ordering::Relaxed);
         self.inner.changed.notify_all();
     }
@@ -187,6 +194,7 @@ impl Share {
             token: cfg.share_token.clone(),
             port: cfg.share_port,
             stop: AtomicBool::new(false),
+            clients: Mutex::new(Vec::new()),
         });
         let listener = match TcpListener::bind(("0.0.0.0", cfg.share_port)) {
             Ok(l) => l,
@@ -298,6 +306,8 @@ fn client(stream: TcpStream, inner: Arc<Inner>) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(PING_INTERVAL_SECS * 6)))?;
+    // a master that stops reading must not hold up the goodbye
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let writer = Arc::new(Mutex::new(BufWriter::new(stream)));
     match read_frame(&mut reader)? {
@@ -319,6 +329,7 @@ fn client(stream: TcpStream, inner: Arc<Inner>) -> std::io::Result<()> {
     }
     let info = inner.info.lock().unwrap().clone();
     write_frame(&mut *writer.lock().unwrap(), &Frame::Info(info.clone()))?;
+    inner.clients.lock().unwrap().push(writer.clone());
 
     let alive = Arc::new(AtomicBool::new(true));
     {
@@ -376,6 +387,7 @@ fn client(stream: TcpStream, inner: Arc<Inner>) -> std::io::Result<()> {
     };
     alive.store(false, Ordering::Relaxed);
     inner.changed.notify_all();
+    inner.clients.lock().unwrap().retain(|w| !Arc::ptr_eq(w, &writer));
     crate::log!("share: {peer} disconnected");
     result
 }

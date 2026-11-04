@@ -19,6 +19,8 @@ mod unixcpu;
 #[cfg(windows)]
 mod wincpu;
 
+use std::io::BufWriter;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -36,6 +38,8 @@ pub struct Shared {
     pub info: Mutex<Info>,
     pub collector: Mutex<collect::Collector>,
     pub cfg: Config,
+    /// writers of the connected masters, for the goodbye on exit
+    pub clients: Mutex<Vec<Arc<Mutex<BufWriter<TcpStream>>>>>,
 }
 
 fn usage() -> ! {
@@ -132,6 +136,9 @@ fn main() {
     }
     cfg.interval_ms = cfg.interval_ms.clamp(250, 60_000);
 
+    // before any thread starts, so the stop signals reach only the thread that waits for them
+    #[cfg(unix)]
+    net::block_exit_signals();
     let mut collector = collect::Collector::new(&cfg.id, &cfg.name, AGENT_VERSION);
     if dump {
         std::thread::sleep(Duration::from_millis(500));
@@ -146,7 +153,8 @@ fn main() {
     let info = collector.info.clone();
     eprintln!("winstats-agent {AGENT_VERSION}: {} ({} {}), {} cores, port {}, multicast {}, config {}", info.name, info.os, info.arch, info.cores, cfg.port, if cfg.multicast { "on" } else { "off" }, path.display());
 
-    let shared = Arc::new(Shared { snap: Mutex::new(Snapshot::default()), changed: Condvar::new(), info: Mutex::new(info), collector: Mutex::new(collector), cfg: cfg.clone() });
+    let shared = Arc::new(Shared { snap: Mutex::new(Snapshot::default()), changed: Condvar::new(), info: Mutex::new(info), collector: Mutex::new(collector), cfg: cfg.clone(), clients: Mutex::new(Vec::new()) });
+    net::exit_with_goodbye(shared.clone());
 
     // sampler
     {

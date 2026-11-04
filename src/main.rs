@@ -1157,6 +1157,11 @@ unsafe extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
+        // Windows is shutting down or restarting: stop sharing now, which tells the masters
+        WM_ENDSESSION if wparam.0 != 0 => {
+            with_app(|app| app.share = None);
+            LRESULT(0)
+        }
         update::WM_APP_UPDATE => {
             update_result(hwnd, wparam.0 == 1);
             LRESULT(0)
