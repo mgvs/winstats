@@ -393,13 +393,27 @@ unsafe fn register_class(hinstance: HINSTANCE, name: &str, proc: WNDPROC) {
 }
 
 impl App {
+    fn detach_bar(&mut self) {
+        self.popup.hide("taskbar changed");
+        if self.drag.take().is_some() {
+            unsafe { let _ = ReleaseCapture(); }
+        }
+        if let Some(old) = self.taskbar.take().filter(Taskbar::alive) {
+            old.restore();
+        }
+        unsafe {
+            if IsWindow(self.bar).as_bool() {
+                let _ = DestroyWindow(self.bar);
+            }
+        }
+        self.bar = HWND::default();
+        self.fullscreen_hidden = false;
+    }
+
     fn ensure_bar(&mut self) -> bool {
         let target = taskbar::target(&self.cfg.monitor);
         if self.taskbar.as_ref().filter(|t| t.alive()).map(|t| t.tray) != target {
-            self.popup.hide("display changed");
-            if let Some(old) = self.taskbar.take().filter(Taskbar::alive) {
-                old.restore();
-            }
+            self.detach_bar();
             self.taskbar = target.map(|tray| taskbar::find(self.floating, tray));
             match &self.taskbar {
                 Some(t) => log!(
@@ -454,6 +468,8 @@ impl App {
             self.bar = bar;
             let tb = self.taskbar.as_ref().unwrap();
             if !tb.attach(bar) {
+                unsafe { let _ = DestroyWindow(bar); }
+                self.bar = HWND::default();
                 return false;
             }
             log!("bar window {:?} attached to taskbar", bar);
@@ -763,7 +779,10 @@ impl App {
         }
 
         let offset = theme.s(self.cfg.offset as f32);
-        let rc = tb.place(self.bar, total, &self.cfg.position, offset);
+        let Some(rc) = tb.place(self.bar, total, &self.cfg.position, offset) else {
+            self.popup.hide("strip does not fit");
+            return;
+        };
         if self.ticks == 1 {
             log!("placed bar at {:?}", rc);
         }
@@ -1192,8 +1211,7 @@ unsafe extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             if created != 0 && msg == created {
                 log!("TaskbarCreated: explorer restarted, re-attaching");
                 with_app(|app| {
-                    app.taskbar = None;
-                    app.bar = HWND::default();
+                    app.detach_bar();
                     app.tick();
                 });
                 return LRESULT(0);

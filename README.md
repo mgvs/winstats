@@ -387,7 +387,7 @@ cpu = "green"
 
 ## Limitations
 
-- To move the strip to a different monitor, enable its Windows taskbar and choose it from the right-click **Display** menu. The strip falls back to the primary taskbar while the selected taskbar is unavailable.
+- To move the strip to a different monitor, enable its Windows taskbar and choose it from the right-click **Display** menu. The strip falls back to the primary taskbar while the selected taskbar is unavailable. On Windows 11, the secondary taskbar clock is measured through Windows UI Automation when no native notification-area window is available. If the clock cannot be measured, right-aligned widgets use the left edge temporarily.
 - Windows 11: the centred task list is XAML and cannot be shrunk, so with many open windows it runs over the strip.
   Workarounds: `position = "left"` (the area left of a centred list is usually free) or `mode = "floating"`.
 - No temperatures or fan speeds: reading them needs a kernel driver, which winstats does not ship.

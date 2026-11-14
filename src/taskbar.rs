@@ -4,7 +4,7 @@
 use crate::util::{pcwstr, wide};
 use std::cell::Cell;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomation2, TreeScope_Descendants, UIA_ClassNamePropertyId,
@@ -24,6 +24,7 @@ pub struct Taskbar {
     pub floating: bool,
     pub tray: HWND,
     pub notify: Option<HWND>,
+    secondary: bool,
     clock: Option<SecondaryClock>,
     /// Windows 10 only: the task-list host we shrink to make room.
     pub rebar: Option<HWND>,
@@ -103,8 +104,22 @@ pub fn target(monitor: &str) -> Option<HWND> {
 /// cannot stall the strip's drawing or menu. Dropping the taskbar stops polling.
 struct SecondaryClock {
     _stop: Sender<()>,
-    updates: Receiver<Option<RECT>>,
-    bounds: Cell<Option<RECT>>,
+    updates: Receiver<Option<ClockBounds>>,
+    bounds: Cell<Option<ClockBounds>>,
+}
+
+#[derive(Clone, Copy)]
+struct ClockBounds {
+    clock: RECT,
+    tray: RECT,
+    dpi: Option<u32>,
+    measured: Instant,
+}
+
+fn window_rect(window: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(window, &mut rect).ok()? };
+    Some(rect)
 }
 
 impl SecondaryClock {
@@ -126,7 +141,15 @@ impl SecondaryClock {
         if let Some(bounds) = self.updates.try_iter().last() {
             self.bounds.set(bounds);
         }
-        let bounds = self.bounds.get()?;
+        let sample = self.bounds.get()?;
+        let current = window_rect(tray)?;
+        if sample.measured.elapsed() > Duration::from_secs(5)
+            || current != sample.tray
+            || crate::util::dpi_for_window(tray) != sample.dpi
+        {
+            return None;
+        }
+        let bounds = sample.clock;
         let mut points = [
             POINT { x: bounds.left, y: bounds.top },
             POINT { x: bounds.right, y: bounds.bottom },
@@ -138,7 +161,7 @@ impl SecondaryClock {
     }
 }
 
-unsafe fn observe_clock(tray: HWND, send: &Sender<Option<RECT>>, stopped: &Receiver<()>) -> windows::core::Result<()> {
+unsafe fn observe_clock(tray: HWND, send: &Sender<Option<ClockBounds>>, stopped: &Receiver<()>) -> windows::core::Result<()> {
     let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
     if let Ok(timeout) = automation.cast::<IUIAutomation2>() {
         let _ = timeout.SetConnectionTimeout(500);
@@ -149,13 +172,19 @@ unsafe fn observe_clock(tray: HWND, send: &Sender<Option<RECT>>, stopped: &Recei
     let class = VARIANT::from(BSTR::from("SystemTray.OmniButtonLeft"));
     let condition = automation.CreatePropertyCondition(UIA_ClassNamePropertyId, &class)?;
     loop {
-        let bounds = (|| -> windows::core::Result<Option<RECT>> {
+        let bounds = (|| -> windows::core::Result<Option<ClockBounds>> {
+            let Some(initial_tray) = window_rect(tray) else { return Ok(None) };
+            let dpi = crate::util::dpi_for_window(tray);
             let root = automation.ElementFromHandle(tray)?;
             let clock = root.FindFirst(TreeScope_Descendants, &condition)?;
             if clock.CurrentIsOffscreen()?.as_bool() {
                 return Ok(None);
             }
-            Ok(Some(clock.CurrentBoundingRectangle()?))
+            let clock = clock.CurrentBoundingRectangle()?;
+            if window_rect(tray) != Some(initial_tray) || crate::util::dpi_for_window(tray) != dpi {
+                return Ok(None);
+            }
+            Ok(Some(ClockBounds { clock, tray: initial_tray, dpi, measured: Instant::now() }))
         })().ok().flatten();
         if send.send(bounds).is_err()
             || stopped.recv_timeout(Duration::from_secs(2)) != Err(mpsc::RecvTimeoutError::Timeout)
@@ -169,8 +198,11 @@ pub fn find(floating: bool, tray: HWND) -> Taskbar {
     let notify = find_child(tray, "TrayNotifyWnd");
     let rebar = find_child(tray, "ReBarWindow32");
     let rebar_original = rebar.and_then(|r| child_rect(tray, r));
-    let clock = (notify.is_none() && Some(tray) != primary()).then(|| SecondaryClock::start(tray));
-    Taskbar { floating, tray, notify, clock, rebar, rebar_original }
+    let secondary = Some(tray) != primary();
+    // This XAML clock class belongs to Windows 11 Explorer.
+    let clock = (secondary && notify.is_none() && crate::util::is_windows11())
+        .then(|| SecondaryClock::start(tray));
+    Taskbar { floating, tray, notify, secondary, clock, rebar, rebar_original }
 }
 
 /// Rect of `child` expressed in `parent` client coordinates.
@@ -182,6 +214,20 @@ pub fn child_rect(parent: HWND, child: HWND) -> Option<RECT> {
         MapWindowPoints(None, parent, &mut pts);
         Some(RECT { left: pts[0].x, top: pts[0].y, right: pts[1].x, bottom: pts[1].y })
     }
+}
+
+fn secondary_left(client: RECT, anchor: Option<i32>, width: i32, position: &str, offset: i32) -> Option<i32> {
+    let right = anchor.unwrap_or(client.right).clamp(client.left, client.right.max(client.left));
+    let last_start = right - width;
+    if last_start < client.left {
+        return None;
+    }
+    let offset = offset.clamp(0, last_start - client.left);
+    Some(match (position, anchor) {
+        ("left", _) => client.left + offset,
+        (_, Some(_)) => last_start - offset,
+        (_, None) => client.left,
+    })
 }
 
 impl Taskbar {
@@ -266,33 +312,28 @@ impl Taskbar {
 
     /// Position the strip; `len` is its size along the taskbar. Returns the rect used (taskbar
     /// client coords).
-    pub fn place(&self, hwnd: HWND, len: i32, position: &str, offset_px: i32) -> RECT {
+    pub fn place(&self, hwnd: HWND, len: i32, position: &str, offset_px: i32) -> Option<RECT> {
         let rc = self.client();
         let notify = self.notify.and_then(|n| child_rect(self.tray, n));
         if self.vertical() {
-            return self.place_vertical(hwnd, len, position, offset_px, rc, notify);
+            return Some(self.place_vertical(hwnd, len, position, offset_px, rc, notify));
         }
         let h = rc.bottom - rc.top;
         let width = len;
         let clock_left = self.clock.as_ref().and_then(|clock| clock.left(self.tray, rc));
         let anchor = notify.map(|n| n.left).or(clock_left);
-        let position = if self.clock.is_some()
-            && anchor.map_or(true, |right| right - rc.left < width)
-        {
-            "left"
+        let x = if self.secondary {
+            let Some(x) = secondary_left(rc, anchor, width, position, offset_px) else {
+                unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
+                return None;
+            };
+            x
         } else {
-            position
+            match position {
+                "left" => rc.left + offset_px,
+                _ => anchor.unwrap_or(rc.right) - width - offset_px,
+            }.max(rc.left)
         };
-        let x = match position {
-            "left" => rc.left + offset_px,
-            _ => {
-                let anchor = anchor.unwrap_or(rc.right);
-                // A negative user offset must not move the strip into the secondary clock.
-                let offset = if clock_left.is_some() { offset_px.max(0) } else { offset_px };
-                anchor - width - offset
-            }
-        };
-        let x = x.max(rc.left);
         unsafe {
             if let (Some(rebar), Some(orig)) = (self.rebar, self.rebar_original) {
                 // Windows 10: shrink the task list so it does not run underneath us.
@@ -313,7 +354,7 @@ impl Taskbar {
                 let _ = SetWindowPos(hwnd, HWND_TOP, x, rc.top, width, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
             }
         }
-        RECT { left: x, top: rc.top, right: x + width, bottom: rc.top + h }
+        Some(RECT { left: x, top: rc.top, right: x + width, bottom: rc.top + h })
     }
 
     /// Vertical taskbar: the strip is a column. "left" is the top end, "right" the end next to
@@ -322,6 +363,7 @@ impl Taskbar {
         let w = rc.right - rc.left;
         let y = match position {
             "left" => rc.top + offset_px,
+            _ if self.secondary && notify.is_none() => rc.top,
             _ => notify.map(|n| n.top).unwrap_or(rc.bottom) - len - offset_px,
         };
         let y = y.max(rc.top);
@@ -353,5 +395,20 @@ impl Taskbar {
                 let _ = MoveWindow(rebar, orig.left, orig.top, orig.right - orig.left, orig.bottom - orig.top, true);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secondary_strip_leaves_measured_clock_untouched() {
+        let client = RECT { left: 0, right: 2560, top: 0, bottom: 48 };
+        assert_eq!(secondary_left(client, Some(2455), 314, "right", 0), Some(2141));
+        assert_eq!(secondary_left(client, Some(2455), 314, "right", -100), Some(2141));
+        assert_eq!(secondary_left(client, Some(2455), 314, "left", 5000), Some(2141));
+        assert_eq!(secondary_left(client, Some(240), 314, "right", 0), None);
+        assert_eq!(secondary_left(client, None, 314, "right", 2200), Some(0));
     }
 }
