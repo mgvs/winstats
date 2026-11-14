@@ -9,7 +9,7 @@ use crate::widgets::{Kind, Theme};
 use std::time::Instant;
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 use windows::Win32::Foundation::{HINSTANCE, HWND, RECT};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetDC, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, ReleaseDC};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetDC, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, PAINTSTRUCT, ReleaseDC};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WIDTH_DIP: f32 = 300.0;
@@ -544,11 +544,14 @@ impl Popup {
 
         // position: above (or below) the taskbar, centred on the clicked widget
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        let mon = unsafe {
-            let hm = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
-            let _ = GetMonitorInfoW(hm, &mut mi);
-            mi.rcMonitor
-        };
+        // The popup HWND can still be on the primary display or on the
+        // display used by the previous popup. Use the clicked widget instead.
+        let hm = unsafe { MonitorFromRect(&self.anchor, MONITOR_DEFAULTTONEAREST) };
+        if !unsafe { GetMonitorInfoW(hm, &mut mi) }.as_bool() {
+            self.hide("popup monitor unavailable");
+            return;
+        }
+        let mon = mi.rcMonitor;
         let margin = t.s(8.0);
         let tray_vertical = self.tray.bottom - self.tray.top > self.tray.right - self.tray.left;
         let (x, y) = if tray_vertical {
