@@ -1446,6 +1446,8 @@ const MENU_LANG_BASE: usize = 600;
 /// Remote submenu: the discovery toggle, then one block of ids per listed agent
 const MENU_REMOTE_DISCOVERY: usize = 700;
 const MENU_REMOTE_SHARE: usize = 701;
+/// opens the dialog that adds a machine discovery cannot reach (another network, a cloud VM)
+const MENU_REMOTE_ADD: usize = 702;
 const MENU_DISPLAY_BASE: usize = 1000;
 const MENU_REMOTE_BASE: usize = 2000;
 const MENU_REMOTE_STRIDE: usize = 200;
@@ -1514,6 +1516,7 @@ unsafe fn remote_menu(cfg: &Config, entries: &[RemoteEntry], dpi: u32, vertical:
         let rm = CreatePopupMenu().ok()?;
         menu_item(rm, MENU_REMOTE_DISCOVERY, &t("menu.discovery"), cfg.discovery);
         menu_item(rm, MENU_REMOTE_SHARE, &t("menu.share"), cfg.share);
+        menu_item(rm, MENU_REMOTE_ADD, &t("menu.add_address"), false);
         let _ = AppendMenuW(rm, MF_SEPARATOR, 0, PCWSTR::null());
         if entries.is_empty() {
             let txt = wide(&t(if cfg.discovery { "menu.no_agents" } else { "menu.discovery_off" }));
@@ -1900,7 +1903,7 @@ fn menu_state(fresh: bool) -> Option<MenuState> {
 fn menu_sticky(id: u32) -> bool {
     let id = id as usize;
     match id {
-        MENU_EXIT | MENU_CONFIG | MENU_RELOAD | MENU_TASKMGR | MENU_ABOUT | MENU_CHECK_UPDATE | MENU_GET_UPDATE => false,
+        MENU_EXIT | MENU_CONFIG | MENU_RELOAD | MENU_TASKMGR | MENU_ABOUT | MENU_CHECK_UPDATE | MENU_GET_UPDATE | MENU_REMOTE_ADD => false,
         c if (MENU_DISPLAY_BASE..MENU_REMOTE_BASE).contains(&c) => false,
         c if c >= MENU_REMOTE_BASE => !matches!((c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE, RM_CONNECT | RM_FORGET | RM_EDIT_LABEL),
         _ => true,
@@ -1947,7 +1950,8 @@ fn menu_command(cmd: u32) {
                 log!("autostart change failed");
             }
         }
-        // the label dialog runs its own message loop: outside `with_app`, so the strip keeps ticking
+        // the dialogs run their own message loop: outside `with_app`, so the strip keeps ticking
+        MENU_REMOTE_ADD => add_remote_by_address(),
         c if c >= MENU_REMOTE_BASE && (c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE == RM_EDIT_LABEL => {
             edit_remote_label((c - MENU_REMOTE_BASE) / MENU_REMOTE_STRIDE);
         }
@@ -1957,12 +1961,79 @@ fn menu_command(cmd: u32) {
     }
 }
 
-/// Three letters from a machine name, the label a newly connected machine starts with.
 /// Longest label the dialog accepts.
 const LABEL_MAX: usize = widgets::LABEL_MAX;
 
-fn default_label(name: &str) -> String {
-    name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect::<String>().to_uppercase()
+use remote::default_label;
+
+/// Where a dialog opened from the menu goes: the strip's DPI and the point just above the strip,
+/// under the pointer.
+fn dialog_anchor(app: &App) -> (u32, POINT) {
+    let dpi = app.taskbar.as_ref().map(|t| t.dpi()).unwrap_or(96);
+    let mut pt = POINT::default();
+    let mut bar = RECT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+        let _ = GetWindowRect(app.bar, &mut bar);
+    }
+    (dpi, POINT { x: pt.x, y: bar.top.min(pt.y) })
+}
+
+/// Longest address and token the Add by address dialog takes.
+const ADDRESS_MAX: usize = 270;
+const TOKEN_MAX: usize = 200;
+
+/// Add a machine by its address, for agents whose beacons do not reach this PC (another
+/// subnet, a VPN, a cloud VM): ask for the address, then for its token. The machine is
+/// connected at once with a CPU history and a memory percentage; its id and name come with the
+/// agent's first answer (see `Remotes::poll`).
+fn add_remote_by_address() {
+    let Some((dpi, above)) = with_app(|app| {
+        app.popup.hide("add remote");
+        dialog_anchor(app)
+    }) else {
+        return;
+    };
+    let mut typed = String::new();
+    let address = loop {
+        let text = input::prompt(&t("dialog.address_title"), &t("dialog.address_prompt"), &typed, ADDRESS_MAX, dpi, above, &t("dialog.ok"), &t("dialog.cancel"));
+        let Some(text) = text else { return };
+        if let Some(a) = remote::normalize_address(&text) {
+            break a;
+        }
+        if text.trim().is_empty() {
+            return;
+        }
+        // not an address: ask again with what was typed
+        typed = text;
+    };
+    let caption = tf("dialog.token_title", &[("address", &address)]);
+    let Some(token) = input::prompt(&caption, &t("dialog.token_prompt"), "", TOKEN_MAX, dpi, above, &t("dialog.ok"), &t("dialog.cancel")) else {
+        return;
+    };
+    let token = token.trim().to_string();
+    with_app(|app| {
+        let existing = app.cfg.remotes.iter().find(|(_, rc)| rc.address.eq_ignore_ascii_case(&address)).map(|(k, _)| k.clone());
+        match existing {
+            // already in the list: connect it with the token given
+            Some(key) => {
+                if let Some(rc) = app.cfg.remotes.get_mut(&key) {
+                    rc.enabled = true;
+                    rc.token = token;
+                }
+            }
+            None => {
+                let host = remote::address_host(&address).to_string();
+                let key = remote::key_for(&host, &app.cfg.remotes);
+                let label = default_label(&host);
+                app.cfg.remotes.insert(key.clone(), config::RemoteCfg { name: host, address, enabled: true, label, token, ..Default::default() });
+                widgets::toggle_widget(&mut app.cfg.widgets, &format!("{key}/cpu_line"));
+                widgets::toggle_widget(&mut app.cfg.widgets, &format!("{key}/mem"));
+            }
+        }
+        app.cfg.save();
+        app.render();
+    });
 }
 
 /// Ask for a new label for the machine in entry `entry` of the Remote submenu; an empty answer
@@ -1973,15 +2044,8 @@ fn edit_remote_label(entry: usize) {
         let key = app.menu_remote.get(entry)?.key.clone()?;
         let rc = app.cfg.remotes.get(&key)?;
         let current = if rc.label.is_empty() { default_label(&rc.name) } else { rc.label.clone() };
-        let dpi = app.taskbar.as_ref().map(|t| t.dpi()).unwrap_or(96);
-        // just above the strip, under the pointer
-        let mut pt = POINT::default();
-        let mut bar = RECT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut pt);
-            let _ = GetWindowRect(app.bar, &mut bar);
-        }
-        Some((key, rc.name.clone(), current, dpi, POINT { x: pt.x, y: bar.top.min(pt.y) }))
+        let (dpi, above) = dialog_anchor(app);
+        Some((key, rc.name.clone(), current, dpi, above))
     })
     .flatten() else {
         return;

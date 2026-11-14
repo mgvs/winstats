@@ -360,8 +360,15 @@ winstats announce and serve itself (`share`, `share_name`, `share_port`, `share_
 - Windows Firewall asks once when discovery or sharing starts; the auto-created rule is "block" if the prompt is
   dismissed, so allow `winstats.exe` in *Windows Defender Firewall > Allow an app* if nothing is found. The agent
   needs `47777/udp` (beacons, only when it discovers) and `47778/tcp` (data) open on its machine.
-- Multicast and broadcast do not cross VLANs or VPNs. For such machines put the address in the config
-  (`address = "10.8.0.5:47778"` under `[remotes.<key>]`); discovery is not needed for them.
+- Multicast and broadcast do not cross VLANs or VPNs. For such machines (another subnet, a VPN, a cloud VM) use
+  *Remote machines > Add by address…*: type the host name or IP (with `:port` if it is not 47778), then the agent's
+  token if it has one. The machine connects at once, and its name and id come with the agent's first answer.
+  Discovery is not needed for it. Typing `address = "10.8.0.5:47778"` under `[remotes.<key>]` in the config does
+  the same.
+- The data link is not encrypted and the token travels in the clear, so do not open port 47778 to the internet.
+  Reach a cloud machine through a VPN (WireGuard, Tailscale) or an SSH tunnel
+  (`ssh -N -L 47779:127.0.0.1:47778 host` with `bind = "127.0.0.1"` on the agent, then add `127.0.0.1:47779`; a
+  local port other than 47778 keeps it clear of *Share this machine*).
 - A `token` on the agent must match `token` in the machine's `[remotes.<key>]` section (and `share_token` for a
   sharing winstats); it keeps casual neighbours out, it is not encryption.
 

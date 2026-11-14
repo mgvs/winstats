@@ -750,7 +750,18 @@ impl Remotes {
             }
             for f in frames {
                 match f {
-                    Frame::Info(i) => agent.apply_info(i),
+                    Frame::Info(i) => {
+                        // a machine added by address: its identity comes with the first answer
+                        if rc.id.is_empty() && !i.id.is_empty() {
+                            if rc.label.is_empty() || rc.label == default_label(&rc.name) {
+                                rc.label = default_label(&i.name);
+                            }
+                            rc.id = i.id.clone();
+                            rc.name = i.name.clone();
+                            changed = true;
+                        }
+                        agent.apply_info(i)
+                    }
                     Frame::Snapshot(s) => agent.apply_snapshot(s),
                     Frame::Details(d) => agent.apply_details(d),
                     _ => {}
@@ -784,6 +795,41 @@ impl Remotes {
     }
 }
 
+/// Three letters from a machine name, the label a newly connected machine starts with.
+pub fn default_label(name: &str) -> String {
+    name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect::<String>().to_uppercase()
+}
+
+/// "host", "host:port", "1.2.3.4", "[::1]:5000" or a bare IPv6 address as typed into the
+/// Add by address dialog, as "host:port" with the agent's port when none is given.
+/// None for text that cannot be an address.
+pub fn normalize_address(text: &str) -> Option<String> {
+    let s = text.trim();
+    if s.is_empty() || s.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if s.parse::<SocketAddr>().is_ok() {
+        return Some(s.to_string());
+    }
+    if let Ok(ip) = s.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, DATA_PORT).to_string());
+    }
+    match s.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.contains(':') && !host.contains('[') => {
+            port.parse::<u16>().ok().filter(|p| *p != 0).map(|_| s.to_string())
+        }
+        Some(_) => None,
+        None if s.contains('[') || s.contains(']') => None,
+        None => Some(format!("{s}:{DATA_PORT}")),
+    }
+}
+
+/// The host part of a "host:port" address.
+pub fn address_host(addr: &str) -> &str {
+    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+    host.trim_start_matches('[').trim_end_matches(']')
+}
+
 /// Key under `[remotes]` for a newly connected agent: its name, lowercase, safe characters.
 pub fn key_for(name: &str, taken: &BTreeMap<String, RemoteCfg>) -> String {
     let mut base: String = name.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
@@ -801,4 +847,28 @@ pub fn key_for(name: &str, taken: &BTreeMap<String, RemoteCfg>) -> String {
         n += 1;
     }
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addresses() {
+        assert_eq!(normalize_address(" 10.0.0.5 ").as_deref(), Some("10.0.0.5:47778"));
+        assert_eq!(normalize_address("10.0.0.5:5000").as_deref(), Some("10.0.0.5:5000"));
+        assert_eq!(normalize_address("box.example.com").as_deref(), Some("box.example.com:47778"));
+        assert_eq!(normalize_address("box:47779").as_deref(), Some("box:47779"));
+        assert_eq!(normalize_address("fd00::5").as_deref(), Some("[fd00::5]:47778"));
+        assert_eq!(normalize_address("[fd00::5]").as_deref(), Some("[fd00::5]:47778"));
+        assert_eq!(normalize_address("[fd00::5]:5000").as_deref(), Some("[fd00::5]:5000"));
+        assert_eq!(normalize_address(""), None);
+        assert_eq!(normalize_address("a b"), None);
+        assert_eq!(normalize_address("box:port"), None);
+        assert_eq!(normalize_address("box:0"), None);
+        assert_eq!(normalize_address(":5000"), None);
+        assert_eq!(address_host("box.example.com:47778"), "box.example.com");
+        assert_eq!(address_host("[fd00::5]:47778"), "fd00::5");
+        assert_eq!(default_label("node1-nv1"), "NOD");
+    }
 }
