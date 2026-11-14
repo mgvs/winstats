@@ -16,6 +16,7 @@ pub struct Taskbar {
     pub floating: bool,
     pub tray: HWND,
     pub notify: Option<HWND>,
+    secondary: bool,
     /// Windows 10 only: the task-list host we shrink to make room.
     pub rebar: Option<HWND>,
     pub rebar_original: Option<RECT>,
@@ -94,7 +95,8 @@ pub fn find(floating: bool, tray: HWND) -> Taskbar {
     let notify = find_child(tray, "TrayNotifyWnd");
     let rebar = find_child(tray, "ReBarWindow32");
     let rebar_original = rebar.and_then(|r| child_rect(tray, r));
-    Taskbar { floating, tray, notify, rebar, rebar_original }
+    let secondary = Some(tray) != primary();
+    Taskbar { floating, tray, notify, secondary, rebar, rebar_original }
 }
 
 /// Rect of `child` expressed in `parent` client coordinates.
@@ -201,7 +203,12 @@ impl Taskbar {
         let x = match position {
             "left" => rc.left + offset_px,
             _ => {
-                let anchor = notify.map(|n| n.left).unwrap_or(rc.right);
+                let anchor = notify.map(|n| n.left).unwrap_or_else(|| {
+                    // Explorer can draw the secondary clock inside a full-width XAML host,
+                    // with no separate notification-area HWND to measure.
+                    let clock_space = if self.secondary { (144 * self.dpi() as i32 + 48) / 96 } else { 0 };
+                    rc.right - clock_space
+                });
                 anchor - width - offset_px
             }
         };
