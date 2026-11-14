@@ -2,6 +2,14 @@
 //! SetParent(our_hwnd, Shell_TrayWnd), then keep it positioned next to the notification area.
 
 use crate::util::{pcwstr, wide};
+use std::cell::Cell;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomation2, TreeScope_Descendants, UIA_ClassNamePropertyId,
+};
+use windows::core::{BSTR, Interface, VARIANT};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow, DISPLAY_DEVICEW,
@@ -16,7 +24,7 @@ pub struct Taskbar {
     pub floating: bool,
     pub tray: HWND,
     pub notify: Option<HWND>,
-    secondary: bool,
+    clock: Option<SecondaryClock>,
     /// Windows 10 only: the task-list host we shrink to make room.
     pub rebar: Option<HWND>,
     pub rebar_original: Option<RECT>,
@@ -91,12 +99,78 @@ pub fn target(monitor: &str) -> Option<HWND> {
     primary()
 }
 
+/// UI Automation calls into Explorer from an MTA worker so a slow provider
+/// cannot stall the strip's drawing or menu. Dropping the taskbar stops polling.
+struct SecondaryClock {
+    _stop: Sender<()>,
+    updates: Receiver<Option<RECT>>,
+    bounds: Cell<Option<RECT>>,
+}
+
+impl SecondaryClock {
+    fn start(tray: HWND) -> Self {
+        let (stop, stopped) = mpsc::channel();
+        let (send, updates) = mpsc::channel();
+        let handle = tray.0 as isize;
+        std::thread::spawn(move || unsafe {
+            if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+                return;
+            }
+            let _ = observe_clock(HWND(handle as _), &send, &stopped);
+            CoUninitialize();
+        });
+        Self { _stop: stop, updates, bounds: Cell::new(None) }
+    }
+
+    fn left(&self, tray: HWND, client: RECT) -> Option<i32> {
+        if let Some(bounds) = self.updates.try_iter().last() {
+            self.bounds.set(bounds);
+        }
+        let bounds = self.bounds.get()?;
+        let mut points = [
+            POINT { x: bounds.left, y: bounds.top },
+            POINT { x: bounds.right, y: bounds.bottom },
+        ];
+        unsafe { MapWindowPoints(None, tray, &mut points) };
+        let [start, end] = points;
+        (start.x > client.left && end.x <= client.right && end.x > start.x
+            && end.y > client.top && start.y < client.bottom).then_some(start.x)
+    }
+}
+
+unsafe fn observe_clock(tray: HWND, send: &Sender<Option<RECT>>, stopped: &Receiver<()>) -> windows::core::Result<()> {
+    let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+    if let Ok(timeout) = automation.cast::<IUIAutomation2>() {
+        let _ = timeout.SetConnectionTimeout(500);
+        let _ = timeout.SetTransactionTimeout(500);
+    }
+    // The secondary Win11 clock shares an AutomationId with the notification
+    // bell. Its class distinguishes it without matching localized time text.
+    let class = VARIANT::from(BSTR::from("SystemTray.OmniButtonLeft"));
+    let condition = automation.CreatePropertyCondition(UIA_ClassNamePropertyId, &class)?;
+    loop {
+        let bounds = (|| -> windows::core::Result<Option<RECT>> {
+            let root = automation.ElementFromHandle(tray)?;
+            let clock = root.FindFirst(TreeScope_Descendants, &condition)?;
+            if clock.CurrentIsOffscreen()?.as_bool() {
+                return Ok(None);
+            }
+            Ok(Some(clock.CurrentBoundingRectangle()?))
+        })().ok().flatten();
+        if send.send(bounds).is_err()
+            || stopped.recv_timeout(Duration::from_secs(2)) != Err(mpsc::RecvTimeoutError::Timeout)
+        {
+            return Ok(());
+        }
+    }
+}
+
 pub fn find(floating: bool, tray: HWND) -> Taskbar {
     let notify = find_child(tray, "TrayNotifyWnd");
     let rebar = find_child(tray, "ReBarWindow32");
     let rebar_original = rebar.and_then(|r| child_rect(tray, r));
-    let secondary = Some(tray) != primary();
-    Taskbar { floating, tray, notify, secondary, rebar, rebar_original }
+    let clock = (notify.is_none() && Some(tray) != primary()).then(|| SecondaryClock::start(tray));
+    Taskbar { floating, tray, notify, clock, rebar, rebar_original }
 }
 
 /// Rect of `child` expressed in `parent` client coordinates.
@@ -200,16 +274,22 @@ impl Taskbar {
         }
         let h = rc.bottom - rc.top;
         let width = len;
+        let clock_left = self.clock.as_ref().and_then(|clock| clock.left(self.tray, rc));
+        let anchor = notify.map(|n| n.left).or(clock_left);
+        let position = if self.clock.is_some()
+            && anchor.map_or(true, |right| right - rc.left < width)
+        {
+            "left"
+        } else {
+            position
+        };
         let x = match position {
             "left" => rc.left + offset_px,
             _ => {
-                let anchor = notify.map(|n| n.left).unwrap_or_else(|| {
-                    // Explorer can draw the secondary clock inside a full-width XAML host,
-                    // with no separate notification-area HWND to measure.
-                    let clock_space = if self.secondary { (144 * self.dpi() as i32 + 48) / 96 } else { 0 };
-                    rc.right - clock_space
-                });
-                anchor - width - offset_px
+                let anchor = anchor.unwrap_or(rc.right);
+                // A negative user offset must not move the strip into the secondary clock.
+                let offset = if clock_left.is_some() { offset_px.max(0) } else { offset_px };
+                anchor - width - offset
             }
         };
         let x = x.max(rc.left);
