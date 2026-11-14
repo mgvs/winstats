@@ -9,6 +9,8 @@ use std::path::PathBuf;
 pub struct Config {
     /// Where the strip goes: "right" (left of the system tray), "left" (left edge of the taskbar)
     pub position: String,
+    /// Monitor device interface for the strip. Empty follows the primary taskbar.
+    pub monitor: String,
     /// Extra pixels (DIP) to shift the strip away from the edge it is attached to.
     pub offset: i32,
     /// Widgets in display order.
@@ -99,6 +101,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             position: "right".into(),
+            monitor: String::new(),
             offset: 0,
             widgets: vec![
                 "cpu_bars".into(),

@@ -3,7 +3,10 @@
 
 use crate::util::{pcwstr, wide};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
-use windows::Win32::Graphics::Gdi::MapWindowPoints;
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayDevicesW, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow, DISPLAY_DEVICEW,
+    MONITORINFOEXW, MONITOR_DEFAULTTONULL,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
 
@@ -23,13 +26,75 @@ fn find_child(parent: HWND, class: &str) -> Option<HWND> {
     unsafe { FindWindowExW(parent, None, pcwstr(&c), PCWSTR::null()).ok() }
 }
 
-pub fn find(floating: bool) -> Option<Taskbar> {
+#[derive(Clone)]
+pub struct DisplayTaskbar {
+    pub id: String,
+    pub label: String,
+    pub tray: HWND,
+}
+
+fn wide_string(value: &[u16]) -> String {
+    String::from_utf16_lossy(&value[..value.iter().position(|&c| c == 0).unwrap_or(value.len())])
+}
+
+fn describe_display(tray: HWND) -> Option<DisplayTaskbar> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    let mut monitor = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+    unsafe {
+        let handle = MonitorFromWindow(tray, MONITOR_DEFAULTTONULL);
+        if !GetMonitorInfoW(handle, &mut info.monitorInfo).as_bool() {
+            return None;
+        }
+        let _ = EnumDisplayDevicesW(PCWSTR(info.szDevice.as_ptr()), 0, &mut monitor, EDD_GET_DEVICE_INTERFACE_NAME);
+    }
+    let source = wide_string(&info.szDevice);
+    let device_id = wide_string(&monitor.DeviceID);
+    let name = wide_string(&monitor.DeviceString);
+    let rect = info.monitorInfo.rcMonitor;
+    let label = format!("{} · {} × {} ({}, {})",
+        if name.is_empty() { &source } else { &name },
+        rect.right - rect.left, rect.bottom - rect.top, rect.left, rect.top);
+    Some(DisplayTaskbar {
+        id: if device_id.is_empty() { source } else { device_id },
+        label,
+        tray,
+    })
+}
+
+fn primary() -> Option<HWND> {
     let cls = wide("Shell_TrayWnd");
-    let tray = unsafe { FindWindowExW(None, None, pcwstr(&cls), PCWSTR::null()).ok()? };
+    unsafe { FindWindowExW(None, None, pcwstr(&cls), PCWSTR::null()).ok() }
+}
+
+fn secondary_taskbars() -> impl Iterator<Item = HWND> {
+    let cls = wide("Shell_SecondaryTrayWnd");
+    let mut previous = None;
+    std::iter::from_fn(move || {
+        let tray = unsafe { FindWindowExW(None, previous.as_ref(), pcwstr(&cls), PCWSTR::null()).ok()? };
+        previous = Some(tray);
+        Some(tray)
+    })
+}
+
+pub fn displays() -> Vec<DisplayTaskbar> {
+    primary().into_iter().chain(secondary_taskbars()).filter_map(describe_display).collect()
+}
+
+pub fn target(monitor: &str) -> Option<HWND> {
+    if !monitor.is_empty() {
+        if let Some(display) = displays().into_iter().find(|display| display.id == monitor) {
+            return Some(display.tray);
+        }
+    }
+    primary()
+}
+
+pub fn find(floating: bool, tray: HWND) -> Taskbar {
     let notify = find_child(tray, "TrayNotifyWnd");
     let rebar = find_child(tray, "ReBarWindow32");
     let rebar_original = rebar.and_then(|r| child_rect(tray, r));
-    Some(Taskbar { floating, tray, notify, rebar, rebar_original })
+    Taskbar { floating, tray, notify, rebar, rebar_original }
 }
 
 /// Rect of `child` expressed in `parent` client coordinates.

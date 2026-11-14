@@ -387,7 +387,7 @@ cpu = "green"
 
 ## Limitations
 
-- Second monitor: the strip only lives on the primary taskbar.
+- To move the strip to a different monitor, enable its Windows taskbar and choose it from the right-click **Display** menu. The strip falls back to the primary taskbar while the selected taskbar is unavailable.
 - Windows 11: the centred task list is XAML and cannot be shrunk, so with many open windows it runs over the strip.
   Workarounds: `position = "left"` (the area left of a centred list is usually free) or `mode = "floating"`.
 - No temperatures or fan speeds: reading them needs a kernel driver, which winstats does not ship.
