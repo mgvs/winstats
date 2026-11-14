@@ -107,7 +107,7 @@ jobs:
   # the agent a name and an icon in Login Items and the "background item added" notice
   agent-macos:
     name: Agent macOS
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Check out
