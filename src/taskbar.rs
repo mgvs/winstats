@@ -24,7 +24,6 @@ pub struct Taskbar {
     pub floating: bool,
     pub tray: HWND,
     pub notify: Option<HWND>,
-    secondary: bool,
     clock: Option<SecondaryClock>,
     /// Windows 10 only: the task-list host we shrink to make room.
     pub rebar: Option<HWND>,
@@ -202,7 +201,7 @@ pub fn find(floating: bool, tray: HWND) -> Taskbar {
     // This XAML clock class belongs to Windows 11 Explorer.
     let clock = (secondary && notify.is_none() && crate::util::is_windows11())
         .then(|| SecondaryClock::start(tray));
-    Taskbar { floating, tray, notify, secondary, clock, rebar, rebar_original }
+    Taskbar { floating, tray, notify, clock, rebar, rebar_original }
 }
 
 /// Rect of `child` expressed in `parent` client coordinates.
@@ -216,17 +215,21 @@ pub fn child_rect(parent: HWND, child: HWND) -> Option<RECT> {
     }
 }
 
-fn secondary_left(client: RECT, anchor: Option<i32>, width: i32, position: &str, offset: i32) -> Option<i32> {
-    let right = anchor.unwrap_or(client.right).clamp(client.left, client.right.max(client.left));
-    let last_start = right - width;
-    if last_start < client.left {
+/// Place along either taskbar axis. An unknown notification boundary makes
+/// the leading edge the safest fallback.
+fn strip_start(start: i32, end: i32, anchor: Option<i32>, len: i32, leading: bool, offset: i32) -> Option<i32> {
+    if end <= start || len <= 0 {
         return None;
     }
-    let offset = offset.clamp(0, last_start - client.left);
-    Some(match (position, anchor) {
-        ("left", _) => client.left + offset,
-        (_, Some(_)) => last_start - offset,
-        (_, None) => client.left,
+    let last_start = anchor.unwrap_or(end).min(end) - len;
+    if last_start < start {
+        return None;
+    }
+    let offset = offset.clamp(0, last_start - start);
+    Some(match (leading, anchor) {
+        (true, _) => start + offset,
+        (false, Some(_)) => last_start - offset,
+        (false, None) => start,
     })
 }
 
@@ -315,77 +318,60 @@ impl Taskbar {
     pub fn place(&self, hwnd: HWND, len: i32, position: &str, offset_px: i32) -> Option<RECT> {
         let rc = self.client();
         let notify = self.notify.and_then(|n| child_rect(self.tray, n));
-        if self.vertical() {
-            return Some(self.place_vertical(hwnd, len, position, offset_px, rc, notify));
-        }
-        let h = rc.bottom - rc.top;
-        let width = len;
-        let clock_left = self.clock.as_ref().and_then(|clock| clock.left(self.tray, rc));
-        let anchor = notify.map(|n| n.left).or(clock_left);
-        let x = if self.secondary {
-            let Some(x) = secondary_left(rc, anchor, width, position, offset_px) else {
-                unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
-                return None;
-            };
-            x
+        let vertical = self.vertical();
+        let (start, end, anchor, thickness) = if vertical {
+            (rc.top, rc.bottom, notify.map(|n| n.top), rc.right - rc.left)
         } else {
-            match position {
-                "left" => rc.left + offset_px,
-                _ => anchor.unwrap_or(rc.right) - width - offset_px,
-            }.max(rc.left)
+            let anchor = notify.map(|n| n.left)
+                .or_else(|| self.clock.as_ref().and_then(|clock| clock.left(self.tray, rc)));
+            (rc.left, rc.right, anchor, rc.bottom - rc.top)
         };
-        unsafe {
-            if let (Some(rebar), Some(orig)) = (self.rebar, self.rebar_original) {
-                // Windows 10: shrink the task list so it does not run underneath us.
-                if let Some(cur) = child_rect(self.tray, rebar) {
-                    let desired_right = if position == "left" { orig.right } else { x - 2 };
-                    let desired_left = if position == "left" { (x + width + 2).max(orig.left) } else { orig.left };
-                    if cur.right != desired_right || cur.left != desired_left {
-                        let _ = MoveWindow(rebar, desired_left, cur.top, desired_right - desired_left, cur.bottom - cur.top, true);
-                    }
-                }
-            }
-            if self.floating {
-                // floating strip: taskbar client coords -> screen, kept above the taskbar
-                let mut pt = POINT { x, y: rc.top };
-                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.tray, &mut pt);
-                let _ = SetWindowPos(hwnd, HWND_TOPMOST, pt.x, pt.y, width, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            } else {
-                let _ = SetWindowPos(hwnd, HWND_TOP, x, rc.top, width, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            }
-        }
-        Some(RECT { left: x, top: rc.top, right: x + width, bottom: rc.top + h })
-    }
+        let leading = position == "left" || anchor.is_none();
+        let offset = if position != "left" && anchor.is_none() { 0 } else { offset_px };
+        let Some(along) = strip_start(start, end, anchor, len, leading, offset)
+            .filter(|_| thickness > 0)
+        else {
+            self.restore();
+            unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
+            return None;
+        };
 
-    /// Vertical taskbar: the strip is a column. "left" is the top end, "right" the end next to
-    /// the notification area, like the horizontal layout turned by 90 degrees.
-    fn place_vertical(&self, hwnd: HWND, len: i32, position: &str, offset_px: i32, rc: RECT, notify: Option<RECT>) -> RECT {
-        let w = rc.right - rc.left;
-        let y = match position {
-            "left" => rc.top + offset_px,
-            _ if self.secondary && notify.is_none() => rc.top,
-            _ => notify.map(|n| n.top).unwrap_or(rc.bottom) - len - offset_px,
-        };
-        let y = y.max(rc.top);
-        unsafe {
-            if let (Some(rebar), Some(orig)) = (self.rebar, self.rebar_original) {
-                if let Some(cur) = child_rect(self.tray, rebar) {
-                    let desired_bottom = if position == "left" { orig.bottom } else { y - 2 };
-                    let desired_top = if position == "left" { (y + len + 2).max(orig.top) } else { orig.top };
-                    if cur.bottom != desired_bottom || cur.top != desired_top {
-                        let _ = MoveWindow(rebar, cur.left, desired_top, cur.right - cur.left, desired_bottom - desired_top, true);
+        if let (Some(rebar), Some(orig)) = (self.rebar, self.rebar_original) {
+            if let Some(cur) = child_rect(self.tray, rebar) {
+                // Keep the task list on the opposite side of the strip on
+                // Explorer versions that expose a native task-list host.
+                let (first, last) = if vertical { (orig.top, orig.bottom) } else { (orig.left, orig.right) };
+                let (new_first, new_last) = if leading {
+                    ((along + len + 2).clamp(first, last), last)
+                } else {
+                    (first, (along - 2).clamp(first, last))
+                };
+                unsafe {
+                    if vertical && (cur.top != new_first || cur.bottom != new_last) {
+                        let _ = MoveWindow(rebar, cur.left, new_first, cur.right - cur.left, new_last - new_first, true);
+                    } else if !vertical && (cur.left != new_first || cur.right != new_last) {
+                        let _ = MoveWindow(rebar, new_first, cur.top, new_last - new_first, cur.bottom - cur.top, true);
                     }
                 }
             }
-            if self.floating {
-                let mut pt = POINT { x: rc.left, y };
-                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.tray, &mut pt);
-                let _ = SetWindowPos(hwnd, HWND_TOPMOST, pt.x, pt.y, w, len, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            } else {
-                let _ = SetWindowPos(hwnd, HWND_TOP, rc.left, y, w, len, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            }
         }
-        RECT { left: rc.left, top: y, right: rc.right, bottom: y + len }
+
+        let (x, y, width, height) = if vertical {
+            (rc.left, along, thickness, len)
+        } else {
+            (along, rc.top, len, thickness)
+        };
+        unsafe {
+            let mut point = POINT { x, y };
+            let order = if self.floating {
+                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.tray, &mut point);
+                HWND_TOPMOST
+            } else {
+                HWND_TOP
+            };
+            let _ = SetWindowPos(hwnd, order, point.x, point.y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+        Some(RECT { left: x, top: y, right: x + width, bottom: y + height })
     }
 
     /// Undo the Windows 10 task-list shrink.
@@ -400,15 +386,19 @@ impl Taskbar {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::strip_start;
 
     #[test]
-    fn secondary_strip_leaves_measured_clock_untouched() {
-        let client = RECT { left: 0, right: 2560, top: 0, bottom: 48 };
-        assert_eq!(secondary_left(client, Some(2455), 314, "right", 0), Some(2141));
-        assert_eq!(secondary_left(client, Some(2455), 314, "right", -100), Some(2141));
-        assert_eq!(secondary_left(client, Some(2455), 314, "left", 5000), Some(2141));
-        assert_eq!(secondary_left(client, Some(240), 314, "right", 0), None);
-        assert_eq!(secondary_left(client, None, 314, "right", 2200), Some(0));
+    fn strip_respects_native_or_measured_boundary() {
+        assert_eq!(strip_start(0, 2560, Some(2455), 314, false, 0), Some(2141));
+        assert_eq!(strip_start(0, 2560, Some(2455), 314, false, -100), Some(2141));
+        assert_eq!(strip_start(0, 2560, Some(2455), 314, true, 5000), Some(2141));
+        assert_eq!(strip_start(0, 2560, Some(240), 314, false, 0), None);
+    }
+
+    #[test]
+    fn missing_boundary_uses_leading_edge_and_checks_capacity() {
+        assert_eq!(strip_start(0, 2560, None, 314, false, 0), Some(0));
+        assert_eq!(strip_start(0, 240, None, 314, true, 0), None);
     }
 }

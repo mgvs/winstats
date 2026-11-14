@@ -18,6 +18,8 @@ chart = "Γράφημα"
 battery = "Μπαταρία"
 
 [menu]
+display = "Οθόνη"
+primary_display = "Χρήση κύριας οθόνης"
 upload_first = "Πρώτα αποστολή"
 speed_units = "Μονάδες ταχύτητας"
 bytes_per_second = "Byte ανά δευτερόλεπτο (B/s)"

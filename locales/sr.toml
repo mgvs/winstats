@@ -18,6 +18,8 @@ chart = "Графикон"
 battery = "Батерија"
 
 [menu]
+display = "Ekran"
+primary_display = "Prati glavni ekran"
 upload_first = "Прво отпремање"
 speed_units = "Јединице брзине"
 bytes_per_second = "Бајтови у секунди (B/s)"

@@ -18,6 +18,8 @@ chart = "Diagram"
 battery = "Batteri"
 
 [menu]
+display = "Bildskärm"
+primary_display = "Följ huvudskärmen"
 upload_first = "Uppladdning först"
 speed_units = "Hastighetsenheter"
 bytes_per_second = "Byte per sekund (B/s)"

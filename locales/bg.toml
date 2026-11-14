@@ -18,6 +18,8 @@ chart = "Графика"
 battery = "Батерия"
 
 [menu]
+display = "Дисплей"
+primary_display = "Следвай основния дисплей"
 upload_first = "Първо качване"
 speed_units = "Единици за скорост"
 bytes_per_second = "Байтове в секунда (B/s)"

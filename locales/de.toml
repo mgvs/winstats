@@ -18,6 +18,8 @@ chart = "Diagramm"
 battery = "Akku"
 
 [menu]
+display = "Bildschirm"
+primary_display = "Hauptbildschirm folgen"
 upload_first = "Upload zuerst"
 speed_units = "Geschwindigkeitseinheiten"
 bytes_per_second = "Bytes pro Sekunde (B/s)"

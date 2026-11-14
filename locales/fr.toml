@@ -18,6 +18,8 @@ chart = "Graphique"
 battery = "Batterie"
 
 [menu]
+display = "Écran"
+primary_display = "Suivre l’écran principal"
 upload_first = "Envoi en premier"
 speed_units = "Unités de vitesse"
 bytes_per_second = "Octets par seconde (B/s)"

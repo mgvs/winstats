@@ -18,6 +18,8 @@ chart = "График"
 battery = "Батарея"
 
 [menu]
+display = "Дисплей"
+primary_display = "Следовать основному дисплею"
 upload_first = "Сначала передача"
 speed_units = "Единицы скорости"
 bytes_per_second = "Байты в секунду (B/s)"

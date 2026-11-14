@@ -18,6 +18,8 @@ chart = "Grafiks"
 battery = "Akumulators"
 
 [menu]
+display = "Displejs"
+primary_display = "Sekot galvenajam displejam"
 upload_first = "Augšupielāde vispirms"
 speed_units = "Ātruma mērvienības"
 bytes_per_second = "Baiti sekundē (B/s)"
