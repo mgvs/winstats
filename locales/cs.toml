@@ -18,6 +18,8 @@ chart = "Graf"
 battery = "Baterie"
 
 [menu]
+display = "Obrazovka"
+primary_display = "Použít hlavní obrazovku"
 upload_first = "Nejprve odesílání"
 speed_units = "Jednotky rychlosti"
 bytes_per_second = "Bajty za sekundu (B/s)"

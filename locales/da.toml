@@ -18,6 +18,8 @@ chart = "Graf"
 battery = "Batteri"
 
 [menu]
+display = "Skærm"
+primary_display = "Følg primær skærm"
 upload_first = "Upload først"
 speed_units = "Hastighedsenheder"
 bytes_per_second = "Bytes pr. sekund (B/s)"

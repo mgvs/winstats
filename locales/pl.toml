@@ -18,6 +18,8 @@ chart = "Wykres"
 battery = "Bateria"
 
 [menu]
+display = "Ekran"
+primary_display = "Używaj ekranu głównego"
 upload_first = "Wysyłanie na górze"
 speed_units = "Jednostki prędkości"
 bytes_per_second = "Bajty na sekundę (B/s)"

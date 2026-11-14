@@ -18,6 +18,8 @@ chart = "Grafiek"
 battery = "Batterij"
 
 [menu]
+display = "Beeldscherm"
+primary_display = "Hoofdscherm volgen"
 upload_first = "Upload eerst"
 speed_units = "Snelheidseenheden"
 bytes_per_second = "Bytes per seconde (B/s)"

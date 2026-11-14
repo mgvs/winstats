@@ -18,6 +18,8 @@ chart = "Grafic"
 battery = "Baterie"
 
 [menu]
+display = "Ecran"
+primary_display = "Urmează ecranul principal"
 upload_first = "Încărcare mai întâi"
 speed_units = "Unități de viteză"
 bytes_per_second = "Octeți pe secundă (B/s)"

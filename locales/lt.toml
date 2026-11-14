@@ -18,6 +18,8 @@ chart = "Grafikas"
 battery = "Baterija"
 
 [menu]
+display = "Ekranas"
+primary_display = "Naudoti pagrindinį ekraną"
 upload_first = "Pirmiausia išsiuntimas"
 speed_units = "Spartos vienetai"
 bytes_per_second = "Baitai per sekundę (B/s)"

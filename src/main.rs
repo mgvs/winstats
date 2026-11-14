@@ -95,6 +95,7 @@ struct App {
     share: Option<share::Share>,
     /// agents listed in the last Remote submenu, in id order
     menu_remote: Vec<RemoteEntry>,
+    menu_displays: Vec<taskbar::DisplayTaskbar>,
     /// last logged layout (widget kinds and widths), to log only changes
     layout_sig: String,
     /// floating mode: the strip is hidden while a full-screen game or presentation runs
@@ -334,6 +335,7 @@ fn main() {
             ping: metrics::ping::Ping::new(&cfg.ping_host),
             share: None,
             menu_remote: Vec::new(),
+            menu_displays: Vec::new(),
             layout_sig: String::new(),
             fullscreen_hidden: false,
             wm_taskbar_created,
@@ -391,9 +393,28 @@ unsafe fn register_class(hinstance: HINSTANCE, name: &str, proc: WNDPROC) {
 }
 
 impl App {
+    fn detach_bar(&mut self) {
+        self.popup.hide("taskbar changed");
+        if self.drag.take().is_some() {
+            unsafe { let _ = ReleaseCapture(); }
+        }
+        if let Some(old) = self.taskbar.take().filter(Taskbar::alive) {
+            old.restore();
+        }
+        unsafe {
+            if IsWindow(self.bar).as_bool() {
+                let _ = DestroyWindow(self.bar);
+            }
+        }
+        self.bar = HWND::default();
+        self.fullscreen_hidden = false;
+    }
+
     fn ensure_bar(&mut self) -> bool {
-        if self.taskbar.as_ref().map(|t| t.alive()).unwrap_or(false) == false {
-            self.taskbar = taskbar::find(self.floating);
+        let target = taskbar::target(&self.cfg.monitor);
+        if self.taskbar.as_ref().filter(|t| t.alive()).map(|t| t.tray) != target {
+            self.detach_bar();
+            self.taskbar = target.map(|tray| taskbar::find(self.floating, tray));
             match &self.taskbar {
                 Some(t) => log!(
                     "taskbar found: tray={:?} notify={:?} rebar={:?} client={:?} dpi={}",
@@ -407,6 +428,9 @@ impl App {
                     return false;
                 }
             }
+        }
+        if self.taskbar.is_none() {
+            return false;
         }
         let alive = unsafe { IsWindow(self.bar).as_bool() };
         // floating: the strip is a top-level window over the taskbar, there is no parent to check
@@ -444,6 +468,8 @@ impl App {
             self.bar = bar;
             let tb = self.taskbar.as_ref().unwrap();
             if !tb.attach(bar) {
+                unsafe { let _ = DestroyWindow(bar); }
+                self.bar = HWND::default();
                 return false;
             }
             log!("bar window {:?} attached to taskbar", bar);
@@ -753,7 +779,10 @@ impl App {
         }
 
         let offset = theme.s(self.cfg.offset as f32);
-        let rc = tb.place(self.bar, total, &self.cfg.position, offset);
+        let Some(rc) = tb.place(self.bar, total, &self.cfg.position, offset) else {
+            self.popup.hide("strip does not fit");
+            return;
+        };
         if self.ticks == 1 {
             log!("placed bar at {:?}", rc);
         }
@@ -1182,8 +1211,7 @@ unsafe extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             if created != 0 && msg == created {
                 log!("TaskbarCreated: explorer restarted, re-attaching");
                 with_app(|app| {
-                    app.taskbar = None;
-                    app.bar = HWND::default();
+                    app.detach_bar();
                     app.tick();
                 });
                 return LRESULT(0);
@@ -1418,6 +1446,7 @@ const MENU_LANG_BASE: usize = 600;
 /// Remote submenu: the discovery toggle, then one block of ids per listed agent
 const MENU_REMOTE_DISCOVERY: usize = 700;
 const MENU_REMOTE_SHARE: usize = 701;
+const MENU_DISPLAY_BASE: usize = 1000;
 const MENU_REMOTE_BASE: usize = 2000;
 const MENU_REMOTE_STRIDE: usize = 200;
 /// items inside an agent's block
@@ -1710,6 +1739,12 @@ unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
         menu_item(pos, MENU_POS_RIGHT, &t("menu.pos_right"), cfg.position != "left");
         menu_item(pos, MENU_POS_LEFT, &t("menu.pos_left"), cfg.position == "left");
         menu_submenu(settings, pos, &t("menu.position"));
+        let displays = CreatePopupMenu().ok()?;
+        menu_item(displays, MENU_DISPLAY_BASE, &t("menu.primary_display"), cfg.monitor.is_empty());
+        for (i, display) in st.displays.iter().enumerate() {
+            menu_item(displays, MENU_DISPLAY_BASE + 1 + i, &display.label.replace('&', "&&"), cfg.monitor == display.id);
+        }
+        menu_submenu(menu, displays, &t("menu.display"));
 
         let interval = CreatePopupMenu().ok()?;
         for (i, (ms, title)) in INTERVALS.iter().enumerate() {
@@ -1824,6 +1859,7 @@ struct MenuState {
     battery_ok: bool,
     update: Option<String>,
     remotes: Vec<RemoteEntry>,
+    displays: Vec<taskbar::DisplayTaskbar>,
     dpi: u32,
     /// the taskbar is docked at a side: the vertical-layout items are shown
     vertical: bool,
@@ -1840,6 +1876,7 @@ fn menu_state(fresh: bool) -> Option<MenuState> {
     with_app(|app| {
         let remotes = if fresh { app.remote_entries() } else { app.menu_remote.clone() };
         app.menu_remote = remotes.clone();
+        if fresh { app.menu_displays = taskbar::displays(); }
         MenuState {
             hidden: app.hidden,
             cfg: app.cfg.clone(),
@@ -1849,6 +1886,7 @@ fn menu_state(fresh: bool) -> Option<MenuState> {
             battery_ok: app.metrics.battery_available,
             update: app.update_available.clone(),
             remotes,
+            displays: app.menu_displays.clone(),
             dpi: app.taskbar.as_ref().map(|t| t.dpi()).or_else(|| util::dpi_for_window(app.hidden)).unwrap_or(96),
             vertical: app.taskbar.as_ref().map_or(false, |t| t.vertical()),
             light: app.strip_light(),
@@ -1863,6 +1901,7 @@ fn menu_sticky(id: u32) -> bool {
     let id = id as usize;
     match id {
         MENU_EXIT | MENU_CONFIG | MENU_RELOAD | MENU_TASKMGR | MENU_ABOUT | MENU_CHECK_UPDATE | MENU_GET_UPDATE => false,
+        c if (MENU_DISPLAY_BASE..MENU_REMOTE_BASE).contains(&c) => false,
         c if c >= MENU_REMOTE_BASE => !matches!((c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE, RM_CONNECT | RM_FORGET | RM_EDIT_LABEL),
         _ => true,
     }
@@ -2308,6 +2347,11 @@ impl App {
                     self.cfg.colors.insert(key, value.to_string());
                 }
                 self.cfg.utilization_colors = false;
+            }
+            MENU_DISPLAY_BASE => self.cfg.monitor.clear(),
+            c if (MENU_DISPLAY_BASE + 1..MENU_REMOTE_BASE).contains(&c) => {
+                let Some(display) = self.menu_displays.get(c - MENU_DISPLAY_BASE - 1) else { return };
+                self.cfg.monitor = display.id.clone();
             }
             MENU_POS_RIGHT => self.cfg.position = "right".into(),
             MENU_POS_LEFT => self.cfg.position = "left".into(),

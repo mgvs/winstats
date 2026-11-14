@@ -18,6 +18,8 @@ chart = "圖表"
 battery = "電池"
 
 [menu]
+display = "顯示器"
+primary_display = "跟隨主顯示器"
 upload_first = "上傳在上"
 speed_units = "速度單位"
 bytes_per_second = "位元組每秒 (B/s)"

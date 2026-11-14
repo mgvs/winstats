@@ -18,6 +18,8 @@ chart = "Diagram"
 battery = "Akkumulátor"
 
 [menu]
+display = "Kijelző"
+primary_display = "Elsődleges kijelző követése"
 upload_first = "Feltöltés felül"
 speed_units = "Sebesség mértékegysége"
 bytes_per_second = "Bájt másodpercenként (B/s)"

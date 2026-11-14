@@ -18,6 +18,8 @@ chart = "Grafik"
 battery = "Pil"
 
 [menu]
+display = "Ekran"
+primary_display = "Ana ekranı takip et"
 upload_first = "Önce yükleme"
 speed_units = "Hız birimleri"
 bytes_per_second = "Saniye başına bayt (B/s)"
