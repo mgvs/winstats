@@ -1524,18 +1524,27 @@ fn draw_gpu(ui: &mut Ui, m: &MetricsData) {
     if !adapter_mem.is_empty() {
         ui.row(&t("popup.video_memory"), &adapter_mem);
     }
-    // whatever the driver reports (D3DKMT perf data); missing ones are left out
+    // whatever the driver reports (D3DKMT perf data). Clocks and power keep their rows from the
+    // start, with a dash until the first reading, so the popup does not grow under the pointer;
+    // a local reading keeps its last value until the next one (see Perf::or)
     let p = m.gpu_perf;
-    if let Some(mhz) = p.core_mhz {
-        ui.row(&t("popup.clock"), &clock_now_max(mhz, p.core_max_mhz));
+    let fixed = m.host.is_empty() && !m.gpu_adapters.is_empty();
+    const DASH: &str = "\u{2014}";
+    match p.core_mhz {
+        Some(mhz) => ui.row(&t("popup.clock"), &clock_now_max(mhz, p.core_max_mhz)),
+        None if fixed => ui.row(&t("popup.clock"), DASH),
+        None => {}
     }
-    if let Some(mhz) = p.mem_mhz {
-        ui.row(&t("popup.mem_clock"), &clock_now_max(mhz, p.mem_max_mhz));
+    match p.mem_mhz {
+        Some(mhz) => ui.row(&t("popup.mem_clock"), &clock_now_max(mhz, p.mem_max_mhz)),
+        None if fixed => ui.row(&t("popup.mem_clock"), DASH),
+        None => {}
     }
     match (p.power_w, p.power_limit_w, p.power) {
         (Some(w), Some(l), _) => ui.row(&t("popup.power"), &format!("{} / {l:.0} {}", watts(w), unit("w"))),
         (Some(w), None, _) => ui.row(&t("popup.power"), &format!("{} {}", watts(w), unit("w"))),
         (None, _, Some(v)) => ui.row(&t("popup.power"), &tf("popup.power_budget", &[("pct", &pct(v))])),
+        _ if fixed => ui.row(&t("popup.power"), DASH),
         _ => {}
     }
     if let Some(h) = p.hotspot {

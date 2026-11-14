@@ -47,6 +47,32 @@ pub struct Perf {
     pub pcie_max_width: Option<u32>,
 }
 
+impl Perf {
+    /// This reading with the gaps filled from an earlier one: a value missing for a moment (the
+    /// sensor thread is still busy, one driver query failed) keeps its row in the popup.
+    pub fn or(self, prev: Perf) -> Perf {
+        Perf {
+            temp: self.temp.or(prev.temp),
+            hotspot: self.hotspot.or(prev.hotspot),
+            core_mhz: self.core_mhz.or(prev.core_mhz),
+            mem_mhz: self.mem_mhz.or(prev.mem_mhz),
+            core_max_mhz: self.core_max_mhz.or(prev.core_max_mhz),
+            mem_max_mhz: self.mem_max_mhz.or(prev.mem_max_mhz),
+            power: self.power.or(prev.power),
+            power_w: self.power_w.or(prev.power_w),
+            power_limit_w: self.power_limit_w.or(prev.power_limit_w),
+            fan_rpm: self.fan_rpm.or(prev.fan_rpm),
+            fan_pct: self.fan_pct.or(prev.fan_pct),
+            mem_bw: self.mem_bw.or(prev.mem_bw),
+            pcie_bw: self.pcie_bw.or(prev.pcie_bw),
+            pcie_gen: self.pcie_gen.or(prev.pcie_gen),
+            pcie_width: self.pcie_width.or(prev.pcie_width),
+            pcie_max_gen: self.pcie_max_gen.or(prev.pcie_max_gen),
+            pcie_max_width: self.pcie_max_width.or(prev.pcie_max_width),
+        }
+    }
+}
+
 #[repr(C)]
 struct OpenAdapterFromLuid {
     luid: LUID,

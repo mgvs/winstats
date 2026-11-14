@@ -147,11 +147,13 @@ impl Gpu {
 
     /// Sensors of the primary adapter (popup only: two kernel queries per call).
     /// Memory in use per adapter from the GPU Adapter Memory counters (by LUID).
+    /// An adapter missing from one sample keeps its last figures, so the row does not blink.
     pub fn set_adapter_mem(&mut self, mem: &std::collections::HashMap<u64, (u64, u64)>) {
         for a in self.adapters.iter_mut() {
-            let m = mem.get(&a.luid);
-            a.dedicated_used = m.map(|m| m.0);
-            a.shared_used = m.map(|m| m.1);
+            if let Some(m) = mem.get(&a.luid) {
+                a.dedicated_used = Some(m.0);
+                a.shared_used = Some(m.1);
+            }
         }
     }
 
@@ -170,9 +172,12 @@ impl Gpu {
             st.want = Some(target.clone());
             cv.notify_all();
         }
-        let perf = st.result.filter(|r| r.0 == target.luid).map(|r| r.1).unwrap_or_default();
+        let fresh = st.result.filter(|r| r.0 == target.luid).map(|r| r.1);
         drop(st);
-        self.adapters[i].perf = perf;
+        // until a reading arrives, and for the values it lacks, the last known ones stay
+        if let Some(perf) = fresh {
+            self.adapters[i].perf = perf.or(self.adapters[i].perf);
+        }
     }
 
     pub fn stop_perf(&mut self) {

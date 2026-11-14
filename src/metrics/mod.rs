@@ -248,6 +248,9 @@ pub struct Metrics {
     proc_at: Option<std::time::Instant>,
     /// the process lists were just refreshed: the GPU list follows on this tick
     procs_fresh: bool,
+    /// load history of every adapter by LUID: switching adapters in the popup shows the chosen
+    /// one's own past instead of continuing the previous one's line
+    gpu_histories: std::collections::HashMap<u64, VecDeque<f32>>,
 }
 
 impl Deref for Metrics {
@@ -321,6 +324,7 @@ impl Metrics {
             proc_interval_ms: 2000,
             proc_at: None,
             procs_fresh: false,
+            gpu_histories: Default::default(),
         }
     }
 
@@ -355,6 +359,9 @@ impl Metrics {
         d.vram_total = self.gpu_dev.vram_total;
         d.vram_used = self.gpu_dev.vram_used;
         d.vram_budget = self.gpu_dev.vram_budget;
+        if let Some(h) = d.gpu_primary.as_ref().and_then(|p| self.gpu_histories.get(&p.luid)) {
+            d.gpu_history = h.clone();
+        }
     }
 
     pub fn set_disks_disabled(&mut self, disabled: &[String]) {
@@ -542,7 +549,16 @@ impl Metrics {
             }
         }
         push(&mut d.disk_history, (d.disk_read as f32, d.disk_write as f32));
-        push(&mut d.gpu_history, d.gpu.unwrap_or(0.0));
+        // the shown adapter's line gets what the widget shows, every other adapter its own load
+        let primary = self.gpu_dev.primary().map(|a| a.luid);
+        for a in &self.gpu_dev.adapters {
+            let v = if Some(a.luid) == primary { d.gpu } else { a.load };
+            push(self.gpu_histories.entry(a.luid).or_default(), v.unwrap_or(0.0));
+        }
+        match primary.and_then(|l| self.gpu_histories.get(&l)) {
+            Some(h) => d.gpu_history = h.clone(),
+            None => push(&mut d.gpu_history, d.gpu.unwrap_or(0.0)),
+        }
 
         let path = wide(&format!("{}\\", self.disk_letter.trim_end_matches('\\')));
         let mut free = 0u64;
