@@ -49,6 +49,15 @@ fn check_size(dpi: u32) -> i32 {
 /// A rounded square of `c` with a slightly darker 1 px rim (keeps white visible on a light
 /// menu). Premultiplied 32-bit DIB, as themed menus expect for `hbmpItem`.
 pub fn swatch(c: Color, dpi: u32) -> Option<HBITMAP> {
+    mark(c, dpi, false)
+}
+
+/// A small round dot of `c` (a remote machine that answers), drawn like `swatch`.
+pub fn dot(c: Color, dpi: u32) -> Option<HBITMAP> {
+    mark(c, dpi, true)
+}
+
+fn mark(c: Color, dpi: u32, round: bool) -> Option<HBITMAP> {
     let s = check_size(dpi);
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -75,7 +84,11 @@ pub fn swatch(c: Color, dpi: u32) -> Option<HBITMAP> {
     let half = s as f32 / 2.0;
     let radius = (s as f32 * 0.28).max(2.0);
     // signed distance to a rounded square centred on the bitmap, `inset` px inside the edge
+    let dot_r = s as f32 * 0.22;
     let inside = |x: f32, y: f32, inset: f32| -> bool {
+        if round {
+            return ((x - half).powi(2) + (y - half).powi(2)).sqrt() < dot_r + 0.5 - inset;
+        }
         let h = half - inset - radius;
         let dx = (x - half).abs() - h;
         let dy = (y - half).abs() - h;

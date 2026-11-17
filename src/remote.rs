@@ -133,6 +133,8 @@ pub struct Link {
     state: Arc<Mutex<LinkState>>,
     stop: Arc<AtomicBool>,
     pub addr: String,
+    /// the token it says hello with: a new one in the config starts a new link
+    token: String,
 }
 
 impl Link {
@@ -143,9 +145,10 @@ impl Link {
             let state = state.clone();
             let stop = stop.clone();
             let addr = addr.clone();
+            let token = token.clone();
             std::thread::Builder::new().name(format!("link {addr}")).spawn(move || link_thread(addr, token, state, stop)).ok();
         }
-        Link { state, stop, addr }
+        Link { state, stop, addr, token }
     }
 }
 
@@ -731,7 +734,7 @@ impl Remotes {
             }
             let want_link = rc.enabled && !rc.address.is_empty();
             match (&agent.link, want_link) {
-                (Some(l), true) if l.addr == rc.address => {}
+                (Some(l), true) if l.addr == rc.address && l.token == rc.token => {}
                 (_, true) => agent.link = Some(Link::start(rc.address.clone(), rc.token.clone())),
                 (Some(_), false) => agent.link = None,
                 (None, false) => {}

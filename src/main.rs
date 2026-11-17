@@ -117,6 +117,8 @@ struct RemoteEntry {
     enabled: bool,
     /// "online", "offline (...)", or "found" for an unconfigured one
     state: String,
+    /// connected and answering: a green dot in the menu
+    online: bool,
     /// cpu / mem from the beacon, when heard
     load: Option<(f32, f32)>,
     /// modules the agent reports
@@ -1514,6 +1516,8 @@ const RM_GROUP_PE: usize = 5;
 const RM_LABELS: usize = 6;
 /// opens the dialog that edits the machine's label
 const RM_EDIT_LABEL: usize = 7;
+/// opens the dialog that edits the machine's token
+const RM_EDIT_TOKEN: usize = 8;
 /// + CATALOG index: stretch that chart of the machine (vertical taskbar)
 const RM_STRETCH: usize = 140;
 const TOP_COUNTS: &[u32] = &[5, 8, 10, 15, 20];
@@ -1625,6 +1629,7 @@ unsafe fn remote_menu(cfg: &Config, entries: &[RemoteEntry], dpi: u32, vertical:
                     let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
                     menu_item(sub, base + RM_LABELS, &t("menu.labels"), rc.map_or(true, |r| r.labels));
                     menu_item(sub, base + RM_EDIT_LABEL, &t("menu.edit_label"), false);
+                    menu_item(sub, base + RM_EDIT_TOKEN, &t("menu.edit_token"), false);
                     menu_item(sub, base + RM_LEFT, &t("menu.move_left"), false);
                     menu_item(sub, base + RM_RIGHT, &t("menu.move_right"), false);
                     let _ = AppendMenuW(sub, MF_SEPARATOR, 0, PCWSTR::null());
@@ -1642,6 +1647,11 @@ unsafe fn remote_menu(cfg: &Config, entries: &[RemoteEntry], dpi: u32, vertical:
                 title.push_str(&format!("  ({})", e.state));
             }
             menu_submenu(rm, sub, &title);
+            if e.online {
+                if let Some(bmp) = menu::dot(Color::rgb(0x2E, 0xB8, 0x4F), dpi) {
+                    menu::set_item_bitmap(rm, (GetMenuItemCount(rm) - 1) as u32, bmp);
+                }
+            }
         }
         Some(rm)
     }
@@ -1955,7 +1965,7 @@ fn menu_sticky(id: u32) -> bool {
     match id {
         MENU_EXIT | MENU_CONFIG | MENU_RELOAD | MENU_TASKMGR | MENU_ABOUT | MENU_CHECK_UPDATE | MENU_GET_UPDATE | MENU_REMOTE_ADD => false,
         c if (MENU_DISPLAY_BASE..MENU_REMOTE_BASE).contains(&c) => false,
-        c if c >= MENU_REMOTE_BASE => !matches!((c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE, RM_CONNECT | RM_FORGET | RM_EDIT_LABEL),
+        c if c >= MENU_REMOTE_BASE => !matches!((c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE, RM_CONNECT | RM_FORGET | RM_EDIT_LABEL | RM_EDIT_TOKEN),
         _ => true,
     }
 }
@@ -2004,6 +2014,16 @@ fn menu_command(cmd: u32) {
         MENU_REMOTE_ADD => add_remote_by_address(),
         c if c >= MENU_REMOTE_BASE && (c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE == RM_EDIT_LABEL => {
             edit_remote_label((c - MENU_REMOTE_BASE) / MENU_REMOTE_STRIDE);
+        }
+        c if c >= MENU_REMOTE_BASE && (c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE == RM_EDIT_TOKEN => {
+            remote_token((c - MENU_REMOTE_BASE) / MENU_REMOTE_STRIDE);
+        }
+        // a machine only heard so far: its token first (the installer gives agents one)
+        c if c >= MENU_REMOTE_BASE
+            && (c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE == RM_CONNECT
+            && with_app(|app| app.menu_remote.get((c - MENU_REMOTE_BASE) / MENU_REMOTE_STRIDE).map_or(false, |e| e.key.is_none())).unwrap_or(false) =>
+        {
+            remote_token((c - MENU_REMOTE_BASE) / MENU_REMOTE_STRIDE);
         }
         other => {
             with_app(|app| app.apply_menu(other));
@@ -2077,6 +2097,48 @@ fn add_remote_by_address() {
                 let key = remote::key_for(&host, &app.cfg.remotes);
                 let label = default_label(&host);
                 app.cfg.remotes.insert(key.clone(), config::RemoteCfg { name: host, address, enabled: true, label, token, ..Default::default() });
+                widgets::toggle_widget(&mut app.cfg.widgets, &format!("{key}/cpu_line"));
+                widgets::toggle_widget(&mut app.cfg.widgets, &format!("{key}/mem"));
+            }
+        }
+        app.cfg.save();
+        app.render();
+    });
+}
+
+/// Ask for the token of the machine in entry `entry` of the Remote submenu: for a machine only
+/// heard so far, then it is connected with it; for a configured one, a new token (the current
+/// one in the box) that the link takes at once. Empty = the agent has no token.
+fn remote_token(entry: usize) {
+    let Some((e, current, dpi, above)) = with_app(|app| {
+        app.popup.hide("token");
+        let e = app.menu_remote.get(entry)?.clone();
+        let current = e.key.as_ref().and_then(|k| app.cfg.remotes.get(k)).map(|rc| rc.token.clone()).unwrap_or_default();
+        let (dpi, above) = dialog_anchor(app);
+        Some((e, current, dpi, above))
+    })
+    .flatten() else {
+        return;
+    };
+    let caption = tf("dialog.token_title", &[("address", &e.name)]);
+    let Some(token) = input::prompt(&caption, &t("dialog.token_prompt"), &current, TOKEN_MAX, dpi, above, &t("dialog.ok"), &t("dialog.cancel")) else {
+        return;
+    };
+    let token = token.trim().to_string();
+    with_app(|app| {
+        match &e.key {
+            Some(key) => {
+                if let Some(rc) = app.cfg.remotes.get_mut(key) {
+                    rc.token = token;
+                    rc.enabled = true;
+                }
+            }
+            None => {
+                // first connection: a config entry named after the machine, with the two charts
+                // every agent can feed
+                let key = remote::key_for(&e.name, &app.cfg.remotes);
+                let label = default_label(&e.name);
+                app.cfg.remotes.insert(key.clone(), config::RemoteCfg { id: e.id.clone(), name: e.name.clone(), address: e.address.clone(), enabled: true, label, token, ..Default::default() });
                 widgets::toggle_widget(&mut app.cfg.widgets, &format!("{key}/cpu_line"));
                 widgets::toggle_widget(&mut app.cfg.widgets, &format!("{key}/mem"));
             }
@@ -2302,6 +2364,7 @@ impl App {
                 address: rc.address.clone(),
                 enabled: rc.enabled,
                 state: if rc.enabled { self.remotes.state_text(key) } else { String::new() },
+                online: rc.enabled && agent.map_or(false, |a| a.online),
                 load: s.map(|s| (s.beacon.cpu, s.beacon.mem)).or_else(|| agent.filter(|a| a.online).map(|a| (a.data.cpu_total, a.data.mem.pct))),
                 has: agent.and_then(|a| a.info.as_ref()).map(|i| i.has.clone()).unwrap_or_else(|| vec!["cpu".into(), "mem".into(), "net".into(), "disk".into()]),
                 hybrid: agent.map_or(false, |a| a.data.cpu_hybrid()),
@@ -2322,6 +2385,7 @@ impl App {
                 address: s.addr.to_string(),
                 enabled: false,
                 state: t("remote.found"),
+                online: false,
                 load: Some((s.beacon.cpu, s.beacon.mem)),
                 has: Vec::new(),
                 hybrid: false,
