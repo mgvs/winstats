@@ -55,6 +55,10 @@ pub enum Action {
     Copy(String),
     /// open / close an expandable block (CPU instruction list, disk details) by key
     Expand(String),
+    /// show a row of a "More" fold with the fold closed too, or only with it open, by key
+    ToggleRow(String),
+    /// a row was dragged: the new order of the rows (all popups, see `merge_order`)
+    MoveRows(Vec<String>),
     /// SYS (true) / USER (false) filter button of the process lists
     ProcFilter(bool),
 }
@@ -78,6 +82,80 @@ struct Tip {
     h: i32,
     font: FontSpec,
     text: String,
+}
+
+/// A row of a "More" fold, collected first and drawn in the user's order (`Ui::flush_fold`).
+struct FRow {
+    key: &'static str,
+    /// shown with the fold closed
+    on: bool,
+    label: String,
+    value: String,
+    color: Color,
+    extra: Extra,
+}
+
+/// What goes with a row of a "More" fold.
+enum Extra {
+    None,
+    /// a click on the row opens this text under it (the expand key, the text)
+    Expand(&'static str, String),
+    /// hovering the row shows this
+    Tip(String),
+}
+
+/// The mouse button went down on a row of a "More" fold: a click when it comes up in place,
+/// a drag once the mouse moves.
+struct Press {
+    /// window coords of the press
+    x: i32,
+    y: i32,
+    key: String,
+    dragging: bool,
+    /// mouse y in content coords
+    cy: i32,
+}
+
+/// Where rows with these keys (in their default order) go given the user's `order`: listed keys
+/// by their place in it, an unlisted one right after the listed row it follows by default.
+/// Rows sharing a key (one per fan) stay together. Returns indices into `keys`.
+fn arrange(keys: &[&str], order: &[String]) -> Vec<usize> {
+    let pos = |k: &str| order.iter().position(|o| o == k).map(|p| p as isize);
+    let mut v: Vec<(isize, u8, usize)> = Vec::with_capacity(keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        v.push(match pos(k) {
+            Some(p) => (p, 0, i),
+            None => ((0..i).rev().find_map(|j| pos(keys[j])).unwrap_or(-1), 1, i),
+        });
+    }
+    v.sort();
+    v.into_iter().map(|(_, _, i)| i).collect()
+}
+
+/// The stored order after a drag: the shown rows in their new order, and every other key of the
+/// old order (rows not shown now, the other popups) right after the key it followed before.
+fn merge_order(old: &[String], shown: &[String]) -> Vec<String> {
+    let mut out = shown.to_vec();
+    for (i, k) in old.iter().enumerate() {
+        if out.contains(k) {
+            continue;
+        }
+        let at = old[..i].iter().rev().find_map(|p| out.iter().position(|o| o == p)).map_or(0, |p| p + 1);
+        out.insert(at, k.clone());
+    }
+    out
+}
+
+/// Where a dragged row would land: the slot among the other rows (key, y, height) and the y
+/// of the line that shows it.
+fn drop_slot(rows: &[(String, i32, i32)], key: &str, y: i32) -> (usize, i32) {
+    let others: Vec<&(String, i32, i32)> = rows.iter().filter(|r| r.0 != key).collect();
+    let n = others.iter().take_while(|r| r.1 + r.2 / 2 < y).count();
+    let line = match others.get(n) {
+        Some(r) => r.1,
+        None => others.last().map_or(y, |r| r.1 + r.2),
+    };
+    (n, line)
 }
 
 /// A pinned process row: keeps showing this process (the last known values once it drops out of
@@ -104,6 +182,15 @@ pub struct Popup {
     expanded: std::collections::HashSet<String>,
     /// SYS / USER filter of the process lists, as configured (drawn on the section header)
     pub proc_filter: (bool, bool),
+    /// rows of the "More" folds moved from their default place, as configured for the machine
+    /// shown (set before each render)
+    pub rows_flipped: std::collections::HashSet<String>,
+    /// the order of the fold rows the user dragged, as configured for the machine shown
+    pub row_order: Vec<String>,
+    /// fold rows of the last render: key, y and height in content coords
+    frows: Vec<(String, i32, i32)>,
+    /// the mouse button is down on a fold row
+    press: Option<Press>,
     /// the process list as shown when the mouse entered it: rows keep their places while the
     /// mouse is over the list so a click lands on the row that was aimed at
     frozen: Option<Vec<crate::metrics::processes::ProcInfo>>,
@@ -226,6 +313,10 @@ impl Popup {
             locks: Vec::new(),
             expanded: Default::default(),
             proc_filter: (true, true),
+            rows_flipped: Default::default(),
+            row_order: Vec::new(),
+            frows: Vec::new(),
+            press: None,
             frozen: None,
             hit_hover: None,
             mouse: None,
@@ -281,6 +372,7 @@ impl Popup {
             self.locks.clear();
         }
         self.frozen = None;
+        self.press = None;
         true
     }
 
@@ -359,6 +451,48 @@ impl Popup {
         self.hit_at(x, y).map(|h| h.action.clone())
     }
 
+    /// The button went down at (x, y), window coords: true when it is on a fold row, which
+    /// then waits for `release` (a click) or a move (a drag).
+    pub fn press(&mut self, x: i32, y: i32) -> bool {
+        let cy = y - self.pad;
+        let Some(row) = self.frows.iter().find(|r| cy >= r.1 && cy < r.1 + r.2) else { return false };
+        self.press = Some(Press { x, y, key: row.0.clone(), dragging: false, cy });
+        true
+    }
+
+    /// A row is being dragged.
+    pub fn dragging(&self) -> bool {
+        self.press.as_ref().map_or(false, |p| p.dragging)
+    }
+
+    /// The button came up: None when nothing was pressed; Some(action) after a press, the click
+    /// of the pressed place or the new order after a drag (None inside when nothing changed).
+    pub fn release(&mut self, x: i32, y: i32) -> Option<Option<Action>> {
+        let p = self.press.take()?;
+        if !p.dragging {
+            return Some(self.click(p.x, p.y));
+        }
+        let _ = x;
+        let (slot, _) = drop_slot(&self.frows, &p.key, y - self.pad);
+        let mut shown: Vec<String> = Vec::new();
+        for r in &self.frows {
+            if r.0 != p.key && !shown.contains(&r.0) {
+                shown.push(r.0.clone());
+            }
+        }
+        let before: Vec<String> = self.frows.iter().map(|r| r.0.clone()).collect();
+        shown.insert(slot.min(shown.len()), p.key.clone());
+        if shown == before {
+            return Some(None);
+        }
+        Some(Some(Action::MoveRows(merge_order(&self.row_order, &shown))))
+    }
+
+    /// The mouse capture went away mid-press: true when a drag was showing (redraw).
+    pub fn cancel_press(&mut self) -> bool {
+        self.press.take().map_or(false, |p| p.dragging)
+    }
+
     pub fn hide(&mut self, reason: &str) {
         if self.visible {
             let _ = reason;
@@ -368,6 +502,7 @@ impl Popup {
             }
             self.visible = false;
             self.hidden_at = Some(Instant::now());
+            self.press = None;
         }
     }
 
@@ -377,6 +512,16 @@ impl Popup {
         let (cx, cy) = (x - self.pad, y - self.pad);
         let tip = self.tips.iter().position(|t| cx >= t.x && cx < t.x + t.w && cy >= t.y && cy < t.y + t.h);
         let mut changed = false;
+        if let Some(p) = &mut self.press {
+            // a few pixels of travel turn the press into a drag
+            if !p.dragging && (y - p.y).abs() > 4 {
+                p.dragging = true;
+            }
+            if p.dragging && p.cy != cy {
+                p.cy = cy;
+                changed = true;
+            }
+        }
         if tip != self.tip {
             self.tip = tip;
             changed = true;
@@ -493,7 +638,7 @@ impl Popup {
         self.content.resize(w - pad * 2, t.s(900.0));
         self.content.clear();
         let copied = self.copy_progress();
-        let mut ui = Ui { c: &mut self.content, t, w: w - pad * 2, y: 0, hover: self.hover, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut self.icons, indent: 0, locks: &mut self.locks, frozen: &mut self.frozen, expanded: &self.expanded, proc_filter: self.proc_filter, mouse: self.mouse, copied };
+        let mut ui = Ui { c: &mut self.content, t, w: w - pad * 2, y: 0, hover: self.hover, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut self.icons, indent: 0, locks: &mut self.locks, frozen: &mut self.frozen, expanded: &self.expanded, proc_filter: self.proc_filter, mouse: self.mouse, copied, flipped: &self.rows_flipped, fold_open: false, fold: Vec::new(), order: &self.row_order, drag: self.press.as_ref().filter(|p| p.dragging).map(|p| (p.key.clone(), p.cy)), frows: Vec::new() };
         match kind {
             Kind::Cpu => draw_cpu(&mut ui, m),
             Kind::Mem => draw_mem(&mut ui, m),
@@ -512,6 +657,7 @@ impl Popup {
         });
         self.tips = std::mem::take(&mut ui.tips);
         self.hits = std::mem::take(&mut ui.hits);
+        self.frows = std::mem::take(&mut ui.frows);
         self.pad = sh + pad;
         if self.tip.map_or(false, |i| i >= self.tips.len()) {
             self.tip = None;
@@ -625,6 +771,19 @@ struct Ui<'a> {
     mouse: Option<(i32, i32)>,
     /// text just copied and the flash progress 0..1
     copied: Option<(String, f32)>,
+    /// rows of the "More" folds moved from their default place
+    flipped: &'a std::collections::HashSet<String>,
+    /// the "More" fold of the popup being drawn is open: every `frow` shows, a click on a label
+    /// moves the row between the folded and the open view
+    fold_open: bool,
+    /// fold rows collected for `flush_fold`
+    fold: Vec<FRow>,
+    /// the user's order of the fold rows
+    order: &'a [String],
+    /// the fold row being dragged and the mouse y (content coords)
+    drag: Option<(String, i32)>,
+    /// fold rows drawn: key, y, height (rows sharing a key as one)
+    frows: Vec<(String, i32, i32)>,
 }
 
 impl Ui<'_> {
@@ -743,6 +902,77 @@ impl Ui<'_> {
 
     fn row_colored(&mut self, label: &str, value: &str, color: Color) {
         self.row_lv(label, value, self.t.dim, color);
+    }
+
+    /// A row of a popup with a "More" fold, drawn by `flush_fold`. Shown with the fold closed when
+    /// it is on (`default_on`, flipped by a click on its label with the fold open).
+    fn frow(&mut self, key: &'static str, default_on: bool, label: &str, value: &str, color: Color) {
+        self.frow_x(key, default_on, label, value, color, Extra::None);
+    }
+
+    /// `frow` with something that goes with the row: a block a click opens, a tooltip.
+    fn frow_x(&mut self, key: &'static str, default_on: bool, label: &str, value: &str, color: Color, extra: Extra) {
+        let on = default_on != self.flipped.contains(key);
+        self.fold.push(FRow { key, on, label: label.to_string(), value: value.to_string(), color, extra });
+    }
+
+    /// Draw the collected fold rows in the user's order. With the fold closed only the on rows;
+    /// with it open all of them, the label of an on row in full text colour and of the others
+    /// dim, a click on the label switching it. Any row can be dragged up or down: the dragged one
+    /// is shaded and a line shows where it goes.
+    fn flush_fold(&mut self) {
+        let rows = std::mem::take(&mut self.fold);
+        let keys: Vec<&str> = rows.iter().map(|r| r.key).collect();
+        let place = arrange(&keys, self.order);
+        let mut rows: Vec<Option<FRow>> = rows.into_iter().map(Some).collect();
+        let dragged = self.drag.as_ref().map(|d| d.0.clone());
+        let f = self.font(11.0, FW_NORMAL);
+        let pad = self.t.s(3.0);
+        for i in place {
+            let Some(r) = rows[i].take() else { continue };
+            if !self.fold_open && !r.on {
+                continue;
+            }
+            let start = self.y;
+            if self.fold_open {
+                // the label is the switch: a faint box under the mouse
+                let (lw, lh) = self.c.measure_text(&r.label, f);
+                let lw = lw.min(self.w / 2) + pad;
+                if dragged.is_none() && self.mouse.map_or(false, |(mx, my)| mx >= 0 && mx < lw && my >= start && my < start + lh) {
+                    self.c.fill_round_rect(-pad, start, lw + pad, lh, pad as f32, self.t.text.alpha(0.06));
+                }
+                self.row_lv(&r.label, &r.value, if r.on { self.t.text } else { self.t.dim }, r.color);
+                self.hits.push(Hit { x: 0, y: start, w: lw, h: lh, action: Action::ToggleRow(r.key.to_string()) });
+            } else {
+                self.row_colored(&r.label, &r.value, r.color);
+            }
+            match r.extra {
+                Extra::None => {}
+                Extra::Expand(key, text) => {
+                    if self.expanded.contains(key) && !text.is_empty() {
+                        self.wrapped(&text, self.t.dim);
+                    }
+                    self.clickable(start, Action::Expand(key.to_string()));
+                }
+                Extra::Tip(text) => self.hover_tip(start, text),
+            }
+            if dragged.as_deref() == Some(r.key) {
+                self.c.fill_round_rect(-pad, start, self.w + pad * 2, self.y - start, pad as f32, self.t.accent.alpha(0.18));
+            }
+            // rows sharing a key (one per fan) are one block
+            match self.frows.last_mut() {
+                Some(last) if last.0 == r.key && last.1 + last.2 == start => last.2 = self.y - start,
+                _ => self.frows.push((r.key.to_string(), start, self.y - start)),
+            }
+        }
+        if let Some((key, my)) = self.drag.clone() {
+            if self.frows.iter().any(|r| r.0 == key) {
+                let (_, ly) = drop_slot(&self.frows, &key, my);
+                let ly = ly - self.t.s(1.5);
+                self.c.fill_round_rect(-pad, ly - self.t.s(1.0), self.w + pad * 2, self.t.s(2.0).max(2), self.t.s(1.0) as f32, self.t.accent);
+            }
+        }
+        self.fold_open = false;
     }
 
     /// Row with explicit label and value colours.
@@ -1324,103 +1554,103 @@ fn draw_cpu(ui: &mut Ui, m: &MetricsData) {
     }
     let hist: Vec<f32> = m.cpu_history.iter().cloned().collect();
     ui.chart(&hist, 70.0, ui.t.chart_color(Kind::Cpu, 0.0));
-    ui.row_colored(&t("popup.load"), &pct(m.cpu_total), ui.t.usage(m.cpu_total, ui.t.text));
+    // the rows stay in place; which of them show with "More" closed is the user's choice (a click
+    // on a label with it open), the diagnostics and fixed facts fold away by default
+    let more = ui.expanded.contains("more:cpu");
+    ui.fold_open = more;
+    let text = ui.t.text;
+    ui.frow("cpu.load", true, &t("popup.load"), &pct(m.cpu_total), ui.t.usage(m.cpu_total, text));
     // kernel / programs in one line: who is busy
-    ui.row(&format!("{} / {}", t("popup.system"), t("popup.user")), &format!("{} / {}", pct(m.cpu_system), pct(m.cpu_user)));
+    ui.frow("cpu.system_user", true, &format!("{} / {}", t("popup.system"), t("popup.user")), &format!("{} / {}", pct(m.cpu_system), pct(m.cpu_user)), text);
     let x = &m.sys;
     if m.cpu_hybrid() {
         // load and current clock per core class
         let (pn, en, pl, el) = m.cpu_pe();
         let top = m.cpu_classes.iter().cloned().max().unwrap_or(0);
         let low = m.cpu_classes.iter().cloned().min().unwrap_or(0);
-        ui.row(&tf("popup.p_cores", &[("n", &pn.to_string())]), &with_clock(pct(pl), m.cpu_clock(Some(top))));
-        ui.row(&tf("popup.e_cores", &[("n", &en.to_string())]), &with_clock(pct(el), m.cpu_clock(Some(low))));
+        ui.frow("cpu.p_cores", true, &tf("popup.p_cores", &[("n", &pn.to_string())]), &with_clock(pct(pl), m.cpu_clock(Some(top))), text);
+        ui.frow("cpu.e_cores", true, &tf("popup.e_cores", &[("n", &en.to_string())]), &with_clock(pct(el), m.cpu_clock(Some(low))), text);
     } else if let Some(mhz) = m.cpu_clock(None) {
-        ui.row(&t("popup.clock"), &clock_text(mhz));
+        ui.frow("cpu.clock", true, &t("popup.clock"), &clock_text(mhz), text);
     }
     // held back by heat, power or firmware limits (shown only while it bites)
     if let Some(v) = x.perf_limit.filter(|v| *v < 0.995) {
-        ui.row_colored(&t("popup.perf_limit"), &pct(v), RED);
+        ui.frow("cpu.perf_limit", true, &t("popup.perf_limit"), &pct(v), RED);
     }
     if x.processes > 0 {
-        ui.row(&t("popup.procs_threads"), &format!("{} / {}", grouped(x.processes as u64), grouped(x.threads as u64)));
+        ui.frow("cpu.procs_threads", true, &t("popup.procs_threads"), &format!("{} / {}", grouped(x.processes as u64), grouped(x.threads as u64)), text);
     }
     if m.load_avg.len() == 3 {
-        ui.row(&t("popup.load_avg"), &format!("{:.2} / {:.2} / {:.2}", m.load_avg[0], m.load_avg[1], m.load_avg[2]));
+        ui.frow("cpu.load_avg", true, &t("popup.load_avg"), &format!("{:.2} / {:.2} / {:.2}", m.load_avg[0], m.load_avg[1], m.load_avg[2]), text);
     }
     // machine fans of an agent (single-board computers): "Fan  40% · 1490 RPM"
     for (i, f) in m.fans.iter().enumerate() {
         let label = if m.fans.len() > 1 { format!("{} {}", t("popup.fan"), i + 1) } else { t("popup.fan") };
-        let text = match (f.duty, f.rpm) {
+        let value = match (f.duty, f.rpm) {
             (Some(d), Some(r)) => format!("{} · {r} {}", pct(d), unit("rpm")),
             (Some(d), None) => pct(d),
             (None, Some(r)) => format!("{r} {}", unit("rpm")),
             _ => continue,
         };
-        ui.row(&label, &text);
+        ui.frow("cpu.fan", true, &label, &value, text);
     }
     // what an agent's machine draws: "Power  12.4 W" (a Mac), "Power VDD_IN  7.2 W" (a Jetson)
     for p in &m.power {
         let label = if m.power.len() > 1 { format!("{} {}", t("popup.power"), p.id) } else { t("popup.power") };
-        ui.row(&label, &format!("{:.1} {}", p.w, unit("w")));
+        ui.frow("cpu.power", true, &label, &format!("{:.1} {}", p.w, unit("w")), text);
     }
-    // diagnostics and fixed facts fold away under "More"
-    let more = ui.expanded.contains("more:cpu");
-    if more {
-        ui.row(&t("popup.idle"), &pct((1.0 - m.cpu_total).max(0.0)));
-        if x.processes > 0 {
-            ui.row(&t("popup.handles"), &grouped(x.handles as u64));
-        }
-        if x.uptime_secs > 0 {
-            ui.row(&t("popup.uptime"), &uptime_text(x.uptime_secs));
-        }
-        if let Some(v) = x.ctx_switches {
-            ui.row(&t("popup.ctx_switches"), &format!("{}{}", grouped(v.round() as u64), unit("per_s")));
-        }
-        if let Some(v) = x.interrupts {
-            let mut text = format!("{}{}", grouped(v.round() as u64), unit("per_s"));
-            if let (Some(dpc), Some(irq)) = (x.dpc_time, x.interrupt_time) {
-                text.push_str(&format!(" · DPC {:.1}% · ISR {:.1}%", dpc * 100.0, irq * 100.0));
-            }
-            ui.row(&t("popup.interrupts"), &text);
-        }
-        if m.cpu_sockets > 1 {
-            ui.row(&t("popup.sockets"), &m.cpu_sockets.to_string());
-        }
-        let c = &m.sys.cpu;
-        if c.cache.iter().any(|v| *v > 0) {
-            // only the levels the CPU has: "Cache L1 / L2" on a Core 2 without L3
-            let levels: Vec<usize> = (0..3).filter(|i| c.cache[*i] > 0).collect();
-            let mut label = t("popup.cache");
-            if let Some(i) = label.find(" L1") {
-                label.truncate(i);
-                label.push(' ');
-                label.push_str(&levels.iter().map(|i| format!("L{}", i + 1)).collect::<Vec<_>>().join(" / "));
-            }
-            ui.row(&label, &levels.iter().map(|i| format_bytes(c.cache[*i])).collect::<Vec<_>>().join(" / "));
-        }
-        match (c.base_mhz, c.max_mhz) {
-            (Some(b), Some(x)) if x > b => ui.row(&t("popup.base_max_clock"), &format!("{} / {}", clock_text(b), clock_text(x))),
-            (Some(b), _) => ui.row(&t("popup.base_clock"), &clock_text(b)),
-            _ => {}
-        }
-        if !c.features.is_empty() {
-            // a click opens the full list of extensions the CPU reports
-            let start = ui.y;
-            ui.row(&t("popup.instructions"), &c.features);
-            let open = ui.expanded.contains("cpu_features");
-            if open && !c.all_features.is_empty() {
-                ui.wrapped(&c.all_features, ui.t.dim);
-            }
-            ui.clickable(start, Action::Expand("cpu_features".to_string()));
-        }
-        // under a hypervisor (Hyper-V, VBS) Windows reports the firmware switch as off
-        if c.hypervisor {
-            ui.row(&t("popup.virtualization"), &t("popup.hypervisor"));
-        } else if let Some(v) = c.virtualization {
-            ui.row(&t("popup.virtualization"), &t(if v { "popup.enabled" } else { "popup.disabled" }));
-        }
+    ui.frow("cpu.idle", false, &t("popup.idle"), &pct((1.0 - m.cpu_total).max(0.0)), text);
+    if x.processes > 0 {
+        ui.frow("cpu.handles", false, &t("popup.handles"), &grouped(x.handles as u64), text);
     }
+    if x.uptime_secs > 0 {
+        ui.frow("cpu.uptime", false, &t("popup.uptime"), &uptime_text(x.uptime_secs), text);
+    }
+    if let Some(v) = x.ctx_switches {
+        ui.frow("cpu.ctx_switches", false, &t("popup.ctx_switches"), &format!("{}{}", grouped(v.round() as u64), unit("per_s")), text);
+    }
+    if let Some(v) = x.interrupts {
+        let mut value = format!("{}{}", grouped(v.round() as u64), unit("per_s"));
+        if let (Some(dpc), Some(irq)) = (x.dpc_time, x.interrupt_time) {
+            value.push_str(&format!(" · DPC {:.1}% · ISR {:.1}%", dpc * 100.0, irq * 100.0));
+        }
+        ui.frow("cpu.interrupts", false, &t("popup.interrupts"), &value, text);
+    }
+    if m.cpu_sockets > 1 {
+        ui.frow("cpu.sockets", false, &t("popup.sockets"), &m.cpu_sockets.to_string(), text);
+    }
+    let c = &m.sys.cpu;
+    if c.cache.iter().any(|v| *v > 0) {
+        // only the levels the CPU has: "Cache L1 / L2" on a Core 2 without L3
+        let levels: Vec<usize> = (0..3).filter(|i| c.cache[*i] > 0).collect();
+        let mut label = t("popup.cache");
+        if let Some(i) = label.find(" L1") {
+            label.truncate(i);
+            label.push(' ');
+            label.push_str(&levels.iter().map(|i| format!("L{}", i + 1)).collect::<Vec<_>>().join(" / "));
+        }
+        ui.frow("cpu.cache", false, &label, &levels.iter().map(|i| format_bytes(c.cache[*i])).collect::<Vec<_>>().join(" / "), text);
+    }
+    match (c.base_mhz, c.max_mhz) {
+        (Some(b), Some(x)) if x > b => {
+            ui.frow("cpu.base_clock", false, &t("popup.base_max_clock"), &format!("{} / {}", clock_text(b), clock_text(x)), text);
+        }
+        (Some(b), _) => {
+            ui.frow("cpu.base_clock", false, &t("popup.base_clock"), &clock_text(b), text);
+        }
+        _ => {}
+    }
+    if !c.features.is_empty() {
+        // a click on the row opens the full list of extensions the CPU reports
+        ui.frow_x("cpu.instructions", false, &t("popup.instructions"), &c.features, text, Extra::Expand("cpu_features", c.all_features.clone()));
+    }
+    // under a hypervisor (Hyper-V, VBS) Windows reports the firmware switch as off
+    if c.hypervisor {
+        ui.frow("cpu.virtualization", false, &t("popup.virtualization"), &t("popup.hypervisor"), text);
+    } else if let Some(v) = c.virtualization {
+        ui.frow("cpu.virtualization", false, &t("popup.virtualization"), &t(if v { "popup.enabled" } else { "popup.disabled" }), text);
+    }
+    ui.flush_fold();
     ui.more_toggle("more:cpu", more);
     let sockets = if m.cpu_sockets > 1 { tf("popup.sockets_suffix", &[("n", &m.cpu_sockets.to_string())]) } else { String::new() };
     if m.cpu_hybrid() {
@@ -1514,15 +1744,19 @@ fn draw_gpu(ui: &mut Ui, m: &MetricsData) {
     }
     let hist: Vec<f32> = m.gpu_history.iter().cloned().collect();
     ui.chart(&hist, 70.0, ui.t.chart_color(Kind::Gpu, 0.0));
+    // the rows stay in place; which of them show with "More" closed is the user's choice
+    let more = ui.expanded.contains("more:gpu");
+    ui.fold_open = more;
+    let text = ui.t.text;
     match m.gpu {
-        Some(v) => ui.row_colored(&t("popup.load"), &pct(v), ui.t.usage(v, ui.t.text)),
-        None => ui.row(&t("popup.load"), &t("popup.na")),
+        Some(v) => ui.frow("gpu.load", true, &t("popup.load"), &pct(v), ui.t.usage(v, text)),
+        None => ui.frow("gpu.load", true, &t("popup.load"), &t("popup.na"), text),
     }
     // memory of the primary adapter in use: "1.2 / 5.9 GB · shared 0.4 GB"
     let primary = m.gpu_primary.as_ref().and_then(|p| m.gpu_adapters.iter().find(|a| a.luid == p.luid));
     let adapter_mem = primary.map(adapter_mem).unwrap_or_default();
     if !adapter_mem.is_empty() {
-        ui.row(&t("popup.video_memory"), &adapter_mem);
+        ui.frow("gpu.video_memory", true, &t("popup.video_memory"), &adapter_mem, text);
     }
     // whatever the driver reports (D3DKMT perf data). Clocks and power keep their rows from the
     // start, with a dash until the first reading, so the popup does not grow under the pointer;
@@ -1531,81 +1765,74 @@ fn draw_gpu(ui: &mut Ui, m: &MetricsData) {
     let fixed = m.host.is_empty() && !m.gpu_adapters.is_empty();
     const DASH: &str = "\u{2014}";
     match p.core_mhz {
-        Some(mhz) => ui.row(&t("popup.clock"), &clock_now_max(mhz, p.core_max_mhz)),
-        None if fixed => ui.row(&t("popup.clock"), DASH),
+        Some(mhz) => ui.frow("gpu.clock", true, &t("popup.clock"), &clock_now_max(mhz, p.core_max_mhz), text),
+        None if fixed => ui.frow("gpu.clock", true, &t("popup.clock"), DASH, text),
         None => {}
     }
     match p.mem_mhz {
-        Some(mhz) => ui.row(&t("popup.mem_clock"), &clock_now_max(mhz, p.mem_max_mhz)),
-        None if fixed => ui.row(&t("popup.mem_clock"), DASH),
+        Some(mhz) => ui.frow("gpu.mem_clock", true, &t("popup.mem_clock"), &clock_now_max(mhz, p.mem_max_mhz), text),
+        None if fixed => ui.frow("gpu.mem_clock", true, &t("popup.mem_clock"), DASH, text),
         None => {}
     }
-    match (p.power_w, p.power_limit_w, p.power) {
-        (Some(w), Some(l), _) => ui.row(&t("popup.power"), &format!("{} / {l:.0} {}", watts(w), unit("w"))),
-        (Some(w), None, _) => ui.row(&t("popup.power"), &format!("{} {}", watts(w), unit("w"))),
-        (None, _, Some(v)) => ui.row(&t("popup.power"), &tf("popup.power_budget", &[("pct", &pct(v))])),
-        _ if fixed => ui.row(&t("popup.power"), DASH),
-        _ => {}
+    let power = match (p.power_w, p.power_limit_w, p.power) {
+        (Some(w), Some(l), _) => Some(format!("{} / {l:.0} {}", watts(w), unit("w"))),
+        (Some(w), None, _) => Some(format!("{} {}", watts(w), unit("w"))),
+        (None, _, Some(v)) => Some(tf("popup.power_budget", &[("pct", &pct(v))])),
+        _ if fixed => Some(DASH.to_string()),
+        _ => None,
+    };
+    if let Some(v) = power {
+        ui.frow("gpu.power", true, &t("popup.power"), &v, text);
     }
     if let Some(h) = p.hotspot {
         // the hottest point of the die; the tooltip says what the gap to the core reading means
-        let start = ui.y;
-        ui.row(&t("popup.hotspot"), &fmt_temp(h, ui.t.temp_f));
         // the guidance ranges follow the selected unit: they are differences, not readings
-        ui.hover_tip(
-            start,
-            tf(
-                "popup.hotspot_tip",
-                &[
-                    ("gap", &fmt_delta(5.0, 15.0, ui.t.temp_f)),
-                    ("big", &fmt_delta(20.0, 30.0, ui.t.temp_f)),
-                ],
-            ),
-        );
+        let tip = tf("popup.hotspot_tip", &[("gap", &fmt_delta(5.0, 15.0, ui.t.temp_f)), ("big", &fmt_delta(20.0, 30.0, ui.t.temp_f))]);
+        ui.frow_x("gpu.hotspot", true, &t("popup.hotspot"), &fmt_temp(h, ui.t.temp_f), text, Extra::Tip(tip));
     }
-    // the rest folds away under "More"
-    let more = ui.expanded.contains("more:gpu");
-    if more {
-        match (p.fan_pct, p.fan_rpm) {
-            (Some(f), Some(r)) => ui.row(&t("popup.fan"), &format!("{f}% · {r} {}", unit("rpm"))),
-            (Some(f), None) => ui.row(&t("popup.fan"), &format!("{f}%")),
-            (None, Some(r)) => ui.row(&t("popup.fan"), &format!("{r} {}", unit("rpm"))),
-            _ => {}
-        }
-        // "PCIe 3.0 x16 (max 3.0 x16) · 1.2 GB/s"
-        let mut link = String::new();
-        if let (Some(g), Some(w)) = (p.pcie_gen, p.pcie_width) {
-            link = format!("{}.0 x{w}", g);
-            if let (Some(mg), Some(mw)) = (p.pcie_max_gen, p.pcie_max_width) {
-                if (mg, mw) != (g, w) {
-                    link.push_str(&format!(" ({})", tf("popup.max", &[("v", &format!("{mg}.0 x{mw}"))])));
-                }
+    let fan = match (p.fan_pct, p.fan_rpm) {
+        (Some(f), Some(r)) => Some(format!("{f}% · {r} {}", unit("rpm"))),
+        (Some(f), None) => Some(format!("{f}%")),
+        (None, Some(r)) => Some(format!("{r} {}", unit("rpm"))),
+        _ => None,
+    };
+    if let Some(v) = fan {
+        ui.frow("gpu.fan", false, &t("popup.fan"), &v, text);
+    }
+    // "PCIe 3.0 x16 (max 3.0 x16) · 1.2 GB/s"
+    let mut link = String::new();
+    if let (Some(g), Some(w)) = (p.pcie_gen, p.pcie_width) {
+        link = format!("{}.0 x{w}", g);
+        if let (Some(mg), Some(mw)) = (p.pcie_max_gen, p.pcie_max_width) {
+            if (mg, mw) != (g, w) {
+                link.push_str(&format!(" ({})", tf("popup.max", &[("v", &format!("{mg}.0 x{mw}"))])));
             }
         }
-        if let Some(bw) = p.pcie_bw {
-            if !link.is_empty() {
-                link.push_str(" · ");
-            }
-            link.push_str(&format_bytes_rate(bw));
-        }
+    }
+    if let Some(bw) = p.pcie_bw {
         if !link.is_empty() {
-            ui.row("PCIe", &link);
+            link.push_str(" · ");
         }
-        if let Some(bw) = p.mem_bw {
-            ui.row(&t("popup.mem_bandwidth"), &format_bytes_rate(bw));
+        link.push_str(&format_bytes_rate(bw));
+    }
+    if !link.is_empty() {
+        ui.frow("gpu.pcie", false, "PCIe", &link, text);
+    }
+    if let Some(bw) = p.mem_bw {
+        ui.frow("gpu.mem_bandwidth", false, &t("popup.mem_bandwidth"), &format_bytes_rate(bw), text);
+    }
+    if let Some(a) = &m.gpu_primary {
+        // SoC GPUs of remote machines have no PCI ids
+        if a.vendor_id != 0 {
+            let vendor = a.vendor();
+            let ids = format!("{:04X}:{:04X}", a.vendor_id, a.device_id);
+            ui.frow("gpu.vendor_device", false, &t("popup.vendor_device"), &if vendor.is_empty() { ids } else { format!("{vendor} {ids}") }, text);
         }
-        if let Some(a) = &m.gpu_primary {
-            // SoC GPUs of remote machines have no PCI ids
-            if a.vendor_id != 0 {
-                let vendor = a.vendor();
-                let ids = format!("{:04X}:{:04X}", a.vendor_id, a.device_id);
-                ui.row(&t("popup.vendor_device"), &if vendor.is_empty() { ids } else { format!("{vendor} {ids}") });
-            }
-            if !a.driver.is_empty() {
-                ui.row(&t("popup.driver"), &a.driver);
-            }
+        if !a.driver.is_empty() {
+            ui.frow("gpu.driver", false, &t("popup.driver"), &a.driver, text);
         }
     }
+    ui.flush_fold();
     ui.more_toggle("more:gpu", more);
     // DXGI usage is this process's own; the adapter counters above replace it locally
     if adapter_mem.is_empty() {
@@ -1868,7 +2095,32 @@ fn draw_battery(ui: &mut Ui, m: &MetricsData) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_delta, fmt_temp};
+    use super::{arrange, drop_slot, fmt_delta, fmt_temp, merge_order};
+
+    fn v(k: &[&str]) -> Vec<String> {
+        k.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fold_order() {
+        let keys = ["load", "clock", "fan", "fan", "idle", "uptime"];
+        // nothing stored: the default order
+        assert_eq!(arrange(&keys, &[]), vec![0, 1, 2, 3, 4, 5]);
+        // uptime dragged to the top; the rest keep their default order after their anchors
+        assert_eq!(arrange(&keys, &v(&["uptime", "load", "clock"])), vec![5, 0, 1, 2, 3, 4]);
+        // the fans move together, the unlisted rows after them stay with them
+        assert_eq!(arrange(&keys, &v(&["fan", "load"])), vec![2, 3, 4, 5, 0, 1]);
+        // a row the stored order does not know follows the row before it by default
+        assert_eq!(arrange(&["a", "new", "b"], &v(&["b", "a"])), vec![2, 0, 1]);
+        // keys of rows not shown now and of the other popup keep their places
+        assert_eq!(merge_order(&v(&["gpu.a", "x", "limit", "y"]), &v(&["y", "x"])), v(&["gpu.a", "y", "x", "limit"]));
+        assert_eq!(merge_order(&[], &v(&["b", "a"])), v(&["b", "a"]));
+        // rows at y 0, 10, 20 (height 10): dragging "a" below the middle of "c" puts it last
+        let rows = vec![("a".to_string(), 0, 10), ("b".to_string(), 10, 10), ("c".to_string(), 20, 10)];
+        assert_eq!(drop_slot(&rows, "a", 27), (2, 30));
+        assert_eq!(drop_slot(&rows, "c", 3), (0, 0));
+        assert_eq!(drop_slot(&rows, "c", 12), (1, 10));
+    }
 
     #[test]
     fn fahrenheit_conversion_boundaries() {

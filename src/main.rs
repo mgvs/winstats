@@ -563,9 +563,21 @@ impl App {
     }
 
     /// Draw the popup from whichever machine it shows.
+    /// The popup rows shown / folded away and their order, of the machine the popup shows: each
+    /// machine keeps its own. None for a remote machine that is no longer configured.
+    fn popup_row_prefs(&mut self) -> Option<(&mut Vec<String>, &mut Vec<String>)> {
+        match self.popup.source.clone() {
+            None => Some((&mut self.cfg.popup_rows, &mut self.cfg.popup_order)),
+            Some(key) => self.cfg.remotes.get_mut(&key).map(|rc| (&mut rc.popup_rows, &mut rc.popup_order)),
+        }
+    }
+
     fn render_popup(&mut self, first: bool) {
         let light = self.is_light();
         let theme = self.popup_theme();
+        let (rows, order) = self.popup_row_prefs().map(|(r, o)| (r.iter().cloned().collect(), o.clone())).unwrap_or_default();
+        self.popup.rows_flipped = rows;
+        self.popup.row_order = order;
         match self.popup.source.clone() {
             None => self.popup.render(&theme, light, &self.metrics, first),
             Some(key) => {
@@ -1311,18 +1323,56 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            with_app(|app| {
+            // a row that can be dragged waits for the button to come up (a click) or the mouse
+            // to move (a drag); everything else reacts at once
+            let pressed = with_app(|app| {
+                if app.popup.press(x, y) {
+                    return true;
+                }
                 if let Some(action) = app.popup.click(x, y) {
                     app.popup_action(action);
+                }
+                false
+            })
+            .unwrap_or(false);
+            if pressed {
+                SetCapture(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            let action = with_app(|app| app.popup.release(x, y)).flatten();
+            if let Some(released) = action {
+                // outside with_app: losing the capture sends WM_CAPTURECHANGED right away
+                let _ = ReleaseCapture();
+                with_app(|app| match released {
+                    Some(action) => app.popup_action(action),
+                    None => app.render_popup(false),
+                });
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| {
+                if app.popup.cancel_press() {
+                    app.render_popup(false);
                 }
             });
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            // hand over the rows that react to a click
+            // hand over the rows that react to a click, up-down arrows while a row is dragged
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let _ = ScreenToClient(hwnd, &mut pt);
+            if with_app(|app| app.popup.dragging()).unwrap_or(false) {
+                if let Ok(c) = LoadCursorW(None, IDC_SIZENS) {
+                    SetCursor(c);
+                }
+                return LRESULT(1);
+            }
             let clickable = with_app(|app| app.popup.visible && app.popup.click_target(pt.x, pt.y)).unwrap_or(false);
             if clickable {
                 if let Ok(c) = LoadCursorW(None, IDC_HAND) {
@@ -2119,6 +2169,24 @@ impl App {
                 // the "More" folds are remembered, the other expanders last one popup
                 if key.starts_with("more:") {
                     toggle(&mut self.cfg.popup_more, key.clone());
+                    self.cfg.save();
+                }
+                self.render_popup(false);
+                return;
+            }
+            popup::Action::ToggleRow(key) => {
+                // a row of a "More" fold moves between the folded and the open view, for the
+                // machine the popup shows
+                if let Some((rows, _)) = self.popup_row_prefs() {
+                    toggle(rows, key.clone());
+                    self.cfg.save();
+                }
+                self.render_popup(false);
+                return;
+            }
+            popup::Action::MoveRows(order) => {
+                if let Some((_, o)) = self.popup_row_prefs() {
+                    *o = order.clone();
                     self.cfg.save();
                 }
                 self.render_popup(false);

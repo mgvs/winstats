@@ -54,6 +54,13 @@ pub struct Config {
     pub proc_show_user: bool,
     /// Popups whose "More" rows are open, e.g. "more:cpu"
     pub popup_more: Vec<String>,
+    /// This machine's popup rows ("cpu.idle", "gpu.load") whose place is flipped from the
+    /// default: shown with the fold closed instead of only under "More", or the other way round.
+    /// Each remote machine has its own (`RemoteCfg::popup_rows`).
+    pub popup_rows: Vec<String>,
+    /// Order of this machine's popup rows the user dragged ("cpu.load", "cpu.uptime", ...); rows
+    /// not listed follow the listed row they come after by default
+    pub popup_order: Vec<String>,
     /// Vertical taskbar: chart widgets (by name, e.g. "cpu_line", "node1/net_chart") drawn across
     /// the full width of the taskbar, which shows a longer history.
     pub stretched: Vec<String>,
@@ -133,6 +140,8 @@ impl Default for Config {
             proc_show_system: true,
             proc_show_user: true,
             popup_more: Vec::new(),
+            popup_rows: Vec::new(),
+            popup_order: Vec::new(),
             stretched: Vec::new(),
             language: "auto".into(),
             net_disabled: Vec::new(),
@@ -179,6 +188,10 @@ pub struct RemoteCfg {
     pub split_pe: bool,
     /// P-cores first, then E-cores, instead of the hardware order the agent reports
     pub group_pe: bool,
+    /// this machine's popup rows shown or folded away against the default, like `Config::popup_rows`
+    pub popup_rows: Vec<String>,
+    /// this machine's order of the popup rows, like `Config::popup_order`
+    pub popup_order: Vec<String>,
 }
 
 impl Default for RemoteCfg {
@@ -196,6 +209,8 @@ impl Default for RemoteCfg {
             labels: true,
             split_pe: true,
             group_pe: false,
+            popup_rows: Vec::new(),
+            popup_order: Vec::new(),
         }
     }
 }
