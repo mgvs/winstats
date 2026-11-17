@@ -54,6 +54,10 @@ pub struct Config {
     pub proc_show_user: bool,
     /// Popups whose "More" rows are open, e.g. "more:cpu"
     pub popup_more: Vec<String>,
+    /// How many times winstats has started (the agent hint waits for the second start)
+    pub launches: u32,
+    /// The "watch other computers too?" question was asked
+    pub agent_hint_shown: bool,
     /// This machine's popup rows ("cpu.idle", "gpu.load") whose place is flipped from the
     /// default: shown with the fold closed instead of only under "More", or the other way round.
     /// Each remote machine has its own (`RemoteCfg::popup_rows`).
@@ -140,6 +144,8 @@ impl Default for Config {
             proc_show_system: true,
             proc_show_user: true,
             popup_more: Vec::new(),
+            launches: 0,
+            agent_hint_shown: false,
             popup_rows: Vec::new(),
             popup_order: Vec::new(),
             stretched: Vec::new(),

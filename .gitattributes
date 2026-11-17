@@ -1,0 +1,4 @@
+# the install scripts run where they are: sh with LF, the Windows ones with CRLF
+install/*.sh text eol=lf
+install/*.ps1 text eol=crlf
+install/*.cmd text eol=crlf

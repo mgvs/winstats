@@ -53,6 +53,10 @@ const TIMER_ZBURST: usize = 3;
 const ZBURST_TICKS: u32 = 14;
 /// one-shot: quiet update check a while after start
 const TIMER_UPDATE: usize = 4;
+/// the "watch other computers too?" question, a little after the second start
+const TIMER_AGENT_HINT: usize = 9;
+/// how to install the agent on the other machines
+const AGENT_DOCS_URL: &str = "https://github.com/mgvs/winstats/blob/main/docs/agent-quickstart.md";
 const MENU_EXIT: usize = 1;
 const MENU_CONFIG: usize = 2;
 const MENU_RELOAD: usize = 3;
@@ -307,6 +311,8 @@ fn main() {
             cfg.save();
         }
     }
+    cfg.launches = cfg.launches.saturating_add(1);
+    cfg.save();
     let widgets = widgets::build(&cfg.widgets);
     let mut popup = Popup::new(hinstance, "WinStatsPopup", backdrop::Opacity::from_config(&cfg.popup_opacity)).expect("popup window");
     popup.proc_filter = (cfg.proc_show_system, cfg.proc_show_user);
@@ -355,6 +361,10 @@ fn main() {
     unsafe {
         SetTimer(hidden, TIMER_ID, cfg.update_ms.max(250), None);
         SetTimer(hidden, TIMER_UPDATE, 20_000, None);
+        // from the second start on, while no other machine is connected
+        if cfg.launches >= 2 && !cfg.agent_hint_shown && cfg.remotes.is_empty() {
+            SetTimer(hidden, TIMER_AGENT_HINT, 8_000, None);
+        }
         if floating {
             SetTimer(hidden, TIMER_ZORDER, 150, None);
             // react immediately when the taskbar is raised (foreground change or any top-level
@@ -1177,6 +1187,13 @@ unsafe extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 update::check_async(hwnd, false);
                 return LRESULT(0);
             }
+            if wparam.0 == TIMER_AGENT_HINT {
+                unsafe {
+                    let _ = KillTimer(hwnd, TIMER_AGENT_HINT);
+                }
+                agent_hint(hwnd);
+                return LRESULT(0);
+            }
             if wparam.0 == TIMER_ZORDER {
                 with_app(|app| app.raise_bar());
                 return LRESULT(0);
@@ -1500,6 +1517,8 @@ const MENU_REMOTE_DISCOVERY: usize = 700;
 const MENU_REMOTE_SHARE: usize = 701;
 /// opens the dialog that adds a machine discovery cannot reach (another network, a cloud VM)
 const MENU_REMOTE_ADD: usize = 702;
+/// opens the agent quickstart page
+const MENU_REMOTE_INSTALL: usize = 703;
 const MENU_DISPLAY_BASE: usize = 1000;
 const MENU_REMOTE_BASE: usize = 2000;
 const MENU_REMOTE_STRIDE: usize = 200;
@@ -1571,6 +1590,7 @@ unsafe fn remote_menu(cfg: &Config, entries: &[RemoteEntry], dpi: u32, vertical:
         menu_item(rm, MENU_REMOTE_DISCOVERY, &t("menu.discovery"), cfg.discovery);
         menu_item(rm, MENU_REMOTE_SHARE, &t("menu.share"), cfg.share);
         menu_item(rm, MENU_REMOTE_ADD, &t("menu.add_address"), false);
+        menu_item(rm, MENU_REMOTE_INSTALL, &t("menu.install_agent"), false);
         let _ = AppendMenuW(rm, MF_SEPARATOR, 0, PCWSTR::null());
         if entries.is_empty() {
             let txt = wide(&t(if cfg.discovery { "menu.no_agents" } else { "menu.discovery_off" }));
@@ -1881,6 +1901,29 @@ fn open_url(url: &str) {
     }
 }
 
+/// Once, from the second start while no other machine is connected: offer the page that tells
+/// how to put the agent on other computers.
+fn agent_hint(hidden: HWND) {
+    let ask = with_app(|app| {
+        let ask = !app.cfg.agent_hint_shown && app.cfg.remotes.is_empty();
+        if ask {
+            app.cfg.agent_hint_shown = true;
+            app.cfg.save();
+        }
+        ask
+    })
+    .unwrap_or(false);
+    if !ask {
+        return;
+    }
+    let title = wide(&t("dialog.agents_title"));
+    let text = wide(&t("dialog.agents_text"));
+    let r = unsafe { MessageBoxW(hidden, pcwstr(&text), pcwstr(&title), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) };
+    if r == IDYES {
+        open_url(AGENT_DOCS_URL);
+    }
+}
+
 /// A finished update check: remember a newer release for the menu; after a manual check also
 /// tell the user what was found.
 fn update_result(hidden: HWND, manual: bool) {
@@ -1963,7 +2006,7 @@ fn menu_state(fresh: bool) -> Option<MenuState> {
 fn menu_sticky(id: u32) -> bool {
     let id = id as usize;
     match id {
-        MENU_EXIT | MENU_CONFIG | MENU_RELOAD | MENU_TASKMGR | MENU_ABOUT | MENU_CHECK_UPDATE | MENU_GET_UPDATE | MENU_REMOTE_ADD => false,
+        MENU_EXIT | MENU_CONFIG | MENU_RELOAD | MENU_TASKMGR | MENU_ABOUT | MENU_CHECK_UPDATE | MENU_GET_UPDATE | MENU_REMOTE_ADD | MENU_REMOTE_INSTALL => false,
         c if (MENU_DISPLAY_BASE..MENU_REMOTE_BASE).contains(&c) => false,
         c if c >= MENU_REMOTE_BASE => !matches!((c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE, RM_CONNECT | RM_FORGET | RM_EDIT_LABEL | RM_EDIT_TOKEN),
         _ => true,
@@ -2012,6 +2055,7 @@ fn menu_command(cmd: u32) {
         }
         // the dialogs run their own message loop: outside `with_app`, so the strip keeps ticking
         MENU_REMOTE_ADD => add_remote_by_address(),
+        MENU_REMOTE_INSTALL => open_url(AGENT_DOCS_URL),
         c if c >= MENU_REMOTE_BASE && (c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE == RM_EDIT_LABEL => {
             edit_remote_label((c - MENU_REMOTE_BASE) / MENU_REMOTE_STRIDE);
         }

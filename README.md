@@ -72,7 +72,7 @@ Grab `winstats.exe` (x64), `winstats-x86.exe` (x86) or `winstats-arm64.exe` (ARM
 [latest release](https://github.com/mgvs/winstats/releases/latest) and run it, or the matching
 `winstats-<version>-amd64.zip`, `-x86.zip` or `-arm64.zip` with README and LICENSE. No installer, no runtime, a
 single executable. The same page has `winstats-agent-<version>.zip` with the agent for the other machines you want to
-watch (see Remote machines).
+watch; the [agent quickstart](docs/agent-quickstart.md) installs it there with one command.
 
 Every release also has `SHA256SUMS.txt` with the SHA-256 of each file. To check a download, run
 `sha256sum -c SHA256SUMS.txt --ignore-missing` next to it (Git Bash, Linux, macOS has `shasum -a 256 -c`), or compare
@@ -278,9 +278,12 @@ How it fits together:
 
 ### Setting it up
 
-1. Run `winstats-agent` on the other machine (see below).
+1. Install the agent on the other machine: one copied command, see the
+   [agent quickstart](docs/agent-quickstart.md) (or run `winstats-agent` by hand, see below).
 2. Right click the strip, *Remote machines*, tick *Discover agents on the network*. The machines heard appear in the
-   same submenu with their OS, architecture and current load; open one and choose *Connect*.
+   same submenu with their OS, architecture and current load; open one and choose *Connect*, then enter the agent's
+   token (empty when it has none; *Token…* in the machine's submenu changes it later). A green dot marks the machines
+   that are connected and answering.
 3. The machine gets a submenu like a local module: CPU / RAM / Disk / Network, plus GPU and Battery when the agent
    reports them, with the widget types, a Colour submenu
    per module, Show P / E splitter and Group P / E cores when the machine has two kinds of cores, Labels, Move left /
@@ -293,6 +296,18 @@ The vertical label next to a remote widget is the machine's `label` (up to four 
 from its name; change it with *Edit label…* in the machine's submenu or in the config). Toggling interfaces and disks in the popups works the same way and is stored per machine.
 
 ### The agent
+
+**Quick install.** On the other machine, one command downloads the newest agent, starts it now and at every boot,
+gives it a token and prints the address and token to enter in winstats; running it again updates the agent. Details,
+options and uninstalling: [agent quickstart](docs/agent-quickstart.md).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mgvs/winstats/main/install/agent.sh | bash    # Linux, macOS
+```
+
+```powershell
+irm https://raw.githubusercontent.com/mgvs/winstats/main/install/agent.ps1 | iex           # Windows PowerShell
+```
 
 `winstats-agent` is one binary per platform; `winstats-agent-<version>.zip` in the
 [latest release](https://github.com/mgvs/winstats/releases/latest) holds all of them: `winstats-agent-linux-x86_64`

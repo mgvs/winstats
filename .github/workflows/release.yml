@@ -173,6 +173,10 @@ jobs:
           chmod +x agents/winstats-agent-linux-* agents/winstats-agent-macos-* agents/winstats-agent.app/Contents/MacOS/winstats-agent
           cp README.md LICENSE agents/
           (cd agents && zip -9 -q -r "../release/winstats-agent-$version.zip" *)
+          # the same agents one by one under names without the version, for the install scripts
+          # (install/agent.sh, agent.ps1): releases/latest/download/<name> is always the newest
+          cp agents/winstats-agent-linux-* agents/winstats-agent-windows-*.exe release/
+          (cd agents && zip -9 -q -r -y ../release/winstats-agent-macos.zip winstats-agent.app)
           # checksums of everything above, last so that nothing changes after them
           (cd release && sha256sum -- * > ../SHA256SUMS.txt)
           mv SHA256SUMS.txt release/
