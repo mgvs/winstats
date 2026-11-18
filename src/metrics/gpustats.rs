@@ -102,9 +102,10 @@ impl GpuStats {
         out
     }
 
-    /// Load per process id, 0..1, for the processes that can be opened; empty on the first call.
-    /// GPU popup only: a query per process and node.
-    pub fn by_pid(&mut self, pids: impl Iterator<Item = u32>) -> HashMap<u32, f32> {
+    /// Load per (process id, adapter LUID), 0..1: the busiest node of that process on that
+    /// adapter, for the processes that can be opened; empty on the first call. GPU popup only: a
+    /// query per process and node.
+    pub fn by_pid(&mut self, pids: impl Iterator<Item = u32>) -> HashMap<(u32, u64), f32> {
         let now = Instant::now();
         let dt = self.procs_at.map(|t| now.duration_since(t).as_secs_f64() * 1e7).filter(|dt| *dt > 0.0);
         self.procs_at = Some(now);
@@ -115,8 +116,8 @@ impl GpuStats {
                 continue;
             }
             let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) }) else { continue };
-            let mut best: Option<f32> = None;
             for &(luid, count) in &self.adapters {
+                let mut best: Option<f32> = None;
                 for node in 0..count {
                     // a process that never used this adapter fails on its first node already
                     let Some(b) = self.run(QUERY_PROCESS_NODE, luid, h, node) else { break };
@@ -127,12 +128,12 @@ impl GpuStats {
                         best = Some(best.map_or(v, |b| b.max(v)));
                     }
                 }
+                if let Some(v) = best {
+                    out.insert((pid, luid), v);
+                }
             }
             unsafe {
                 let _ = CloseHandle(h);
-            }
-            if let Some(v) = best {
-                out.insert(pid, v);
             }
         }
         // exited processes drop out
@@ -146,7 +147,7 @@ struct Shared {
     loads: HashMap<u64, f32>,
     /// processes to read (GPU popup open); empty: adapters only
     pids: Vec<u32>,
-    by_pid: HashMap<u32, f32>,
+    by_pid: HashMap<(u32, u64), f32>,
 }
 
 /// The queries take tens to hundreds of ms (a sleeping Optimus GPU answers slowly): they run on
@@ -184,7 +185,7 @@ impl GpuStatsWorker {
     }
 
     /// Ask for the processes too (empty: stop) and take the last per-process loads.
-    pub fn by_pid(&self, pids: Vec<u32>) -> HashMap<u32, f32> {
+    pub fn by_pid(&self, pids: Vec<u32>) -> HashMap<(u32, u64), f32> {
         let mut s = self.st.lock().unwrap();
         if pids.is_empty() {
             s.by_pid.clear();

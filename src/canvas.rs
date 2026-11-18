@@ -275,6 +275,20 @@ impl Canvas {
         }
     }
 
+    /// Columns `from..to` of a rounded rectangle: the parts of a bar in several colours, each
+    /// pixel painted once (overlapping translucent pieces would show darker seams).
+    pub fn fill_round_rect_cols(&mut self, x: i32, y: i32, w: i32, h: i32, r: f32, from: i32, to: i32, c: Color) {
+        let r = r.min(w as f32 / 2.0).min(h as f32 / 2.0).max(0.0);
+        for yy in y.max(0)..(y + h).min(self.h) {
+            for xx in from.max(x).max(0)..to.min(x + w).min(self.w) {
+                let cov = round_rect_coverage(xx, yy, x, y, w, h, r);
+                if cov > 0.0 {
+                    self.blend_px(xx, yy, c, cov);
+                }
+            }
+        }
+    }
+
     /// Soft drop shadow of a rounded rectangle fading out over `blur` px; only painted outside
     /// the rectangle itself, so a translucent card drawn on top is not darkened.
     pub fn fill_shadow(&mut self, x: i32, y: i32, w: i32, h: i32, r: f32, blur: f32, dy: i32, c: Color) {

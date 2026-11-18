@@ -3,6 +3,7 @@
 
 use crate::canvas::{Canvas, Color, FW_NORMAL, FW_SEMIBOLD, FontSpec, GREEN, RED, YELLOW};
 use crate::metrics::MetricsData;
+use std::collections::VecDeque;
 use crate::util::{format_bytes, format_bytes_rate, format_duration, format_net_rate, pcwstr, unit, wide};
 use crate::i18n::{t, tf};
 use crate::widgets::{Kind, Theme};
@@ -25,6 +26,57 @@ pub const WRITE: Color = Color::rgb(0xFF, 0x98, 0x00);
 /// timer id of the copy flash on the popup window
 pub const COPY_TIMER: usize = 7;
 const COPY_FLASH_SECS: f32 = 0.8;
+/// frames of a held chart catching up after the mouse left it
+pub const CHART_TIMER: usize = 8;
+const CATCH_UP_SECS: f32 = 0.5;
+
+/// The history charts as they were when the mouse came onto one: they stand still under the
+/// mouse (the rows keep updating), and when it leaves they scroll the skipped samples in.
+struct ChartHold {
+    /// `MetricsData::samples` when the hold began
+    at: u64,
+    cpu: VecDeque<f32>,
+    mem: VecDeque<f32>,
+    gpu: VecDeque<f32>,
+    vram: VecDeque<f32>,
+    net: VecDeque<(f32, f32)>,
+    disk: VecDeque<(f32, f32)>,
+    /// the mouse left: when, and how many samples were skipped by then
+    release: Option<(Instant, usize)>,
+}
+
+impl ChartHold {
+    fn new(m: &MetricsData) -> Self {
+        ChartHold { at: m.samples, cpu: m.cpu_history.clone(), mem: m.mem_history.clone(), gpu: m.gpu_history.clone(), vram: m.vram_history.clone(), net: m.net_history.clone(), disk: m.disk_history.clone(), release: None }
+    }
+
+    /// `m` with its histories `behind` samples short of the live ones, seen through the window
+    /// the hold began with: `behind` = all skipped samples is the held picture, 0 the live one.
+    fn view(&self, m: &MetricsData, behind: usize) -> MetricsData {
+        let skipped = m.samples.saturating_sub(self.at) as usize;
+        let mut v = m.clone();
+        v.cpu_history = held(&self.cpu, &m.cpu_history, skipped, behind);
+        v.mem_history = held(&self.mem, &m.mem_history, skipped, behind);
+        v.gpu_history = held(&self.gpu, &m.gpu_history, skipped, behind);
+        v.vram_history = held(&self.vram, &m.vram_history, skipped, behind);
+        v.net_history = held(&self.net, &m.net_history, skipped, behind);
+        v.disk_history = held(&self.disk, &m.disk_history, skipped, behind);
+        v.charts_behind = behind.min(skipped);
+        v
+    }
+}
+
+/// The held history followed by the `skipped` samples that came since, seen through a window of
+/// the held length that ends `behind` samples before the newest one.
+fn held<T: Copy>(snap: &VecDeque<T>, live: &VecDeque<T>, skipped: usize, behind: usize) -> VecDeque<T> {
+    if snap.is_empty() {
+        return live.clone();
+    }
+    let skipped = skipped.min(live.len());
+    let all: Vec<T> = snap.iter().copied().chain(live.iter().skip(live.len() - skipped).copied()).collect();
+    let start = skipped - behind.min(skipped);
+    all[start..start + snap.len()].iter().copied().collect()
+}
 
 /// Geometry of the last drawn pie chart, in window coordinates, for hover hit-testing.
 #[derive(Clone, Default)]
@@ -61,6 +113,10 @@ pub enum Action {
     MoveRows(Vec<String>),
     /// SYS (true) / USER (false) filter button of the process lists
     ProcFilter(bool),
+    /// "Where the memory goes" as a pie (false) or one bar (true)
+    MemBar(bool),
+    /// the GPU process list by load (false) or by video memory (true)
+    GpuSort(bool),
 }
 
 /// A clickable row rectangle, in content coords.
@@ -76,6 +132,9 @@ struct Hit {
 /// A label that did not fit and was drawn with an ellipsis; hovering it shows the full text.
 #[derive(Clone)]
 struct Tip {
+    /// where the box goes horizontally (centred on it) instead of the left edge of the area:
+    /// the chart value under the mouse follows the mouse
+    ax: Option<i32>,
     x: i32,
     y: i32,
     w: i32,
@@ -114,6 +173,34 @@ struct Press {
     dragging: bool,
     /// mouse y in content coords
     cy: i32,
+}
+
+/// "01:22", "1:05:09": a time span in minutes and seconds, with hours when it has any.
+fn ago(secs: f32) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{:02}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// The sample of an `n`-long history drawn `dx` px into a `w` px wide chart, as `line_chart`
+/// lays it out: a short history stretched across the width, a long one with its newest `w`
+/// samples, one per column.
+fn series_index(n: usize, w: i32, dx: i32) -> Option<usize> {
+    if n == 0 || w <= 0 {
+        return None;
+    }
+    let dx = dx.clamp(0, w - 1) as usize;
+    let w = w as usize;
+    if n == 1 {
+        Some(0)
+    } else if n < w {
+        Some(((dx * (n - 1)) as f32 / (w - 1).max(1) as f32).round() as usize)
+    } else {
+        Some(n - w + dx)
+    }
 }
 
 /// Where rows with these keys (in their default order) go given the user's `order`: listed keys
@@ -182,6 +269,10 @@ pub struct Popup {
     expanded: std::collections::HashSet<String>,
     /// SYS / USER filter of the process lists, as configured (drawn on the section header)
     pub proc_filter: (bool, bool),
+    /// the memory breakdown as one bar instead of the pie, as configured
+    pub mem_bar: bool,
+    /// the GPU process list by video memory, as configured
+    pub gpu_by_vram: bool,
     /// rows of the "More" folds moved from their default place, as configured for the machine
     /// shown (set before each render)
     pub rows_flipped: std::collections::HashSet<String>,
@@ -191,6 +282,12 @@ pub struct Popup {
     frows: Vec<(String, i32, i32)>,
     /// the mouse button is down on a fold row
     press: Option<Press>,
+    /// history charts of the last render (content coords): the mouse over one shows its values
+    charts: Vec<(i32, i32, i32, i32)>,
+    /// the mouse was over a chart at the last move
+    in_chart: bool,
+    /// the charts stand still while the mouse is over one, then catch up
+    hold: Option<ChartHold>,
     /// the process list as shown when the mouse entered it: rows keep their places while the
     /// mouse is over the list so a click lands on the row that was aimed at
     frozen: Option<Vec<crate::metrics::processes::ProcInfo>>,
@@ -313,10 +410,15 @@ impl Popup {
             locks: Vec::new(),
             expanded: Default::default(),
             proc_filter: (true, true),
+            mem_bar: false,
+            gpu_by_vram: false,
             rows_flipped: Default::default(),
             row_order: Vec::new(),
             frows: Vec::new(),
             press: None,
+            charts: Vec::new(),
+            in_chart: false,
+            hold: None,
             frozen: None,
             hit_hover: None,
             mouse: None,
@@ -373,7 +475,29 @@ impl Popup {
         }
         self.frozen = None;
         self.press = None;
+        self.end_hold();
         true
+    }
+
+    /// Drop the held charts at once (another popup, the window hidden).
+    fn end_hold(&mut self) {
+        if self.hold.take().is_some() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, CHART_TIMER);
+            }
+        }
+    }
+
+    /// The mouse left the charts: let the held ones scroll the skipped samples in.
+    fn release_hold(&mut self) {
+        if let Some(h) = &mut self.hold {
+            if h.release.is_none() {
+                h.release = Some((Instant::now(), 0));
+                unsafe {
+                    SetTimer(self.hwnd, CHART_TIMER, 15, None);
+                }
+            }
+        }
     }
 
     /// Light up the segment holding `text` (just copied); a timer redraws until the flash ends.
@@ -427,6 +551,10 @@ impl Popup {
 
     /// The mouse left the window: drop the hover state; true when a redraw is needed.
     pub fn mouse_leave(&mut self) -> bool {
+        if self.in_chart {
+            self.in_chart = false;
+            self.release_hold();
+        }
         let changed = self.mouse.is_some() || self.tip.is_some() || self.hover.is_some();
         self.mouse = None;
         self.tip = None;
@@ -503,6 +631,7 @@ impl Popup {
             self.visible = false;
             self.hidden_at = Some(Instant::now());
             self.press = None;
+            self.end_hold();
         }
     }
 
@@ -512,6 +641,20 @@ impl Popup {
         let (cx, cy) = (x - self.pad, y - self.pad);
         let tip = self.tips.iter().position(|t| cx >= t.x && cx < t.x + t.w && cy >= t.y && cy < t.y + t.h);
         let mut changed = false;
+        // over a history chart every move shows another moment: redraw, and once more on leaving
+        let in_chart = self.charts.iter().any(|&(x, y, w, h)| cx >= x && cx < x + w && cy >= y && cy < y + h);
+        if in_chart || self.in_chart {
+            changed = true;
+        }
+        if in_chart {
+            // back onto a chart while it was catching up: the next render holds it afresh
+            if self.hold.as_ref().map_or(false, |h| h.release.is_some()) {
+                self.end_hold();
+            }
+        } else if self.in_chart {
+            self.release_hold();
+        }
+        self.in_chart = in_chart;
         if let Some(p) = &mut self.press {
             // a few pixels of travel turn the press into a drag
             if !p.dragging && (y - p.y).abs() > 4 {
@@ -575,7 +718,7 @@ impl Popup {
         let w = (tw + px * 2).min(content_w);
         let h = th * lines.len() as i32 + py * 2;
         let gap = t.s(3.0);
-        let x = tip.x.min(content_w - w).max(0);
+        let x = tip.ax.map_or(tip.x, |a| a - w / 2).min(content_w - w).max(0);
         let y = if tip.y - h - gap >= 0 { tip.y - h - gap } else { tip.y + tip.h + gap };
         let bg = if light { Color::rgb(0xFF, 0xFF, 0xFF) } else { Color::rgb(0x2C, 0x2C, 0x2C) };
         let r = t.s(4.0) as f32;
@@ -603,6 +746,37 @@ impl Popup {
         if !self.visible {
             return;
         }
+        // the mouse over a chart holds the charts; after it left they catch up, eased out
+        if self.in_chart && self.hold.is_none() {
+            self.hold = Some(ChartHold::new(m));
+        }
+        let mut done = false;
+        let behind = self.hold.as_mut().map(|h| {
+            let skipped = m.samples.saturating_sub(h.at) as usize;
+            match &mut h.release {
+                None => skipped,
+                Some((at, from)) => {
+                    if *from == 0 {
+                        *from = skipped.max(1);
+                    }
+                    let p = (at.elapsed().as_secs_f32() / CATCH_UP_SECS).min(1.0);
+                    let eased = 1.0 - (1.0 - p).powi(3);
+                    done = p >= 1.0;
+                    ((*from as f32) * (1.0 - eased)).round() as usize
+                }
+            }
+        });
+        if done {
+            self.end_hold();
+        }
+        let view;
+        let m = match (&self.hold, behind) {
+            (Some(h), Some(b)) => {
+                view = h.view(m, b);
+                &view
+            }
+            _ => m,
+        };
         self.light = light;
         let w = t.s(WIDTH_DIP);
         let pad = t.s(PAD_DIP);
@@ -638,7 +812,7 @@ impl Popup {
         self.content.resize(w - pad * 2, t.s(900.0));
         self.content.clear();
         let copied = self.copy_progress();
-        let mut ui = Ui { c: &mut self.content, t, w: w - pad * 2, y: 0, hover: self.hover, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut self.icons, indent: 0, locks: &mut self.locks, frozen: &mut self.frozen, expanded: &self.expanded, proc_filter: self.proc_filter, mouse: self.mouse, copied, flipped: &self.rows_flipped, fold_open: false, fold: Vec::new(), order: &self.row_order, drag: self.press.as_ref().filter(|p| p.dragging).map(|p| (p.key.clone(), p.cy)), frows: Vec::new() };
+        let mut ui = Ui { c: &mut self.content, t, w: w - pad * 2, y: 0, hover: self.hover, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut self.icons, indent: 0, locks: &mut self.locks, frozen: &mut self.frozen, expanded: &self.expanded, proc_filter: self.proc_filter, mem_bar: self.mem_bar, gpu_by_vram: self.gpu_by_vram, mouse: self.mouse, copied, flipped: &self.rows_flipped, fold_open: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (m.sample_age(1, 0), if m.sample_ms > 0.0 { m.sample_ms / 1000.0 } else { 1.0 }), fold: Vec::new(), order: &self.row_order, drag: self.press.as_ref().filter(|p| p.dragging).map(|p| (p.key.clone(), p.cy)), frows: Vec::new() };
         match kind {
             Kind::Cpu => draw_cpu(&mut ui, m),
             Kind::Mem => draw_mem(&mut ui, m),
@@ -658,6 +832,7 @@ impl Popup {
         self.tips = std::mem::take(&mut ui.tips);
         self.hits = std::mem::take(&mut ui.hits);
         self.frows = std::mem::take(&mut ui.frows);
+        self.charts = std::mem::take(&mut ui.charts);
         self.pad = sh + pad;
         if self.tip.map_or(false, |i| i >= self.tips.len()) {
             self.tip = None;
@@ -767,6 +942,10 @@ struct Ui<'a> {
     frozen: &'a mut Option<Vec<crate::metrics::processes::ProcInfo>>,
     expanded: &'a std::collections::HashSet<String>,
     proc_filter: (bool, bool),
+    /// the memory breakdown as one bar
+    mem_bar: bool,
+    /// the GPU process list by video memory
+    gpu_by_vram: bool,
     /// mouse position in content coords, when over the popup
     mouse: Option<(i32, i32)>,
     /// text just copied and the flash progress 0..1
@@ -784,6 +963,12 @@ struct Ui<'a> {
     drag: Option<(String, i32)>,
     /// fold rows drawn: key, y, height (rows sharing a key as one)
     frows: Vec<(String, i32, i32)>,
+    /// history charts drawn, for the values under the mouse
+    charts: Vec<(i32, i32, i32, i32)>,
+    /// the area of the chart drawn last (`probe` adds its values under the mouse)
+    last_chart: (i32, i32, i32, i32),
+    /// how long ago a chart's sample was: (seconds since the newest, seconds per sample)
+    ages: (f32, f32),
 }
 
 impl Ui<'_> {
@@ -796,7 +981,7 @@ impl Ui<'_> {
     fn clipped(&mut self, text: &str, x: i32, y: i32, max_w: i32, font: FontSpec, c: Color) -> (i32, i32) {
         let (tw, th) = self.c.measure_text(text, font);
         if tw > max_w {
-            self.tips.push(Tip { x, y, w: max_w.max(1), h: th, font, text: text.to_string() });
+            self.tips.push(Tip { ax: None, x, y, w: max_w.max(1), h: th, font, text: text.to_string() });
         }
         self.c.draw_text_clipped(text, x, y, max_w, font, c)
     }
@@ -858,35 +1043,117 @@ impl Ui<'_> {
     /// Process section header: the title, and for the local machine the SYS / USER filter
     /// buttons on the right (filled when on).
     fn proc_section(&mut self, name: &str, local: bool) {
-        if !local {
+        self.proc_section_sorted(name, local, None);
+    }
+
+    /// Process section header: the title; with `by_vram` the GPU / VRAM order buttons after it
+    /// (the chosen one filled); for the local machine the SYS / USER filter buttons on the right.
+    fn proc_section_sorted(&mut self, name: &str, local: bool, by_vram: Option<bool>) {
+        if !local && by_vram.is_none() {
             self.section(name);
             self.space(4.0);
             return;
         }
         self.space(8.0);
         let f = self.font(9.5, FW_SEMIBOLD);
-        let (_, h) = self.c.draw_text(&name.to_uppercase(), 0, self.y, f, self.t.dim);
+        let (title_w, h) = self.c.draw_text(&name.to_uppercase(), 0, self.y, f, self.t.dim);
         let fb = self.font(8.5, FW_SEMIBOLD);
         let (pad_x, gap) = (self.t.s(6.0), self.t.s(4.0));
         let bh = h + self.t.s(2.0);
         let by = self.y - self.t.s(1.0);
-        let mut x = self.w;
-        for (label, on, system) in [("USER", self.proc_filter.1, false), ("SYS", self.proc_filter.0, true)] {
-            let (tw, th) = self.c.measure_text(label, fb);
+        let r = self.t.s(2.5) as f32;
+        let button = |ui: &mut Self, x: i32, label: &str, on: bool, action: Action| -> i32 {
+            let (tw, th) = ui.c.measure_text(label, fb);
             let bw = tw + pad_x * 2;
+            if on {
+                ui.c.fill_round_rect(x, by, bw, bh, r, ui.t.text.alpha(0.16));
+            } else {
+                ui.c.stroke_round_rect_r(x, by, bw, bh, r, ui.t.dim.alpha(0.5));
+            }
+            let col = if on { ui.t.text } else { ui.t.dim.alpha(0.7) };
+            ui.c.draw_text(label, x + pad_x, by + (bh - th) / 2, fb, col);
+            ui.hits.push(Hit { x, y: by, w: bw, h: bh, action });
+            bw
+        };
+        if let Some(vram) = by_vram {
+            let mut x = title_w + self.t.s(10.0);
+            x += button(self, x, "GPU", !vram, Action::GpuSort(false)) + gap;
+            button(self, x, "VRAM", vram, Action::GpuSort(true));
+        }
+        if local {
+            let mut x = self.w;
+            for (label, on, system) in [("USER", self.proc_filter.1, false), ("SYS", self.proc_filter.0, true)] {
+                let bw = self.c.measure_text(label, fb).0 + pad_x * 2;
+                x -= bw;
+                button(self, x, label, on, Action::ProcFilter(system));
+                x -= gap;
+            }
+        }
+        self.y += h + self.t.s(8.0);
+    }
+
+    /// Section header with two small switches on the right: the breakdown as a pie (a circle
+    /// icon) or as one bar (a bar icon), the chosen one filled.
+    fn breakdown_section(&mut self, name: &str) {
+        self.space(8.0);
+        let f = self.font(9.5, FW_SEMIBOLD);
+        let (_, h) = self.c.draw_text(&name.to_uppercase(), 0, self.y, f, self.t.dim);
+        let bh = h + self.t.s(2.0);
+        let bw = bh + self.t.s(6.0);
+        let by = self.y - self.t.s(1.0);
+        let r = self.t.s(2.5) as f32;
+        let mut x = self.w;
+        for bar in [true, false] {
             x -= bw;
-            let r = self.t.s(2.5) as f32;
+            let on = self.mem_bar == bar;
             if on {
                 self.c.fill_round_rect(x, by, bw, bh, r, self.t.text.alpha(0.16));
             } else {
                 self.c.stroke_round_rect_r(x, by, bw, bh, r, self.t.dim.alpha(0.5));
             }
             let col = if on { self.t.text } else { self.t.dim.alpha(0.7) };
-            self.c.draw_text(label, x + pad_x, by + (bh - th) / 2, fb, col);
-            self.hits.push(Hit { x, y: by, w: bw, h: bh, action: Action::ProcFilter(system) });
-            x -= gap;
+            let (cx, cy) = (x as f32 + bw as f32 / 2.0, by as f32 + bh as f32 / 2.0);
+            if bar {
+                let (iw, ih) = (self.t.s(11.0), self.t.s(4.0));
+                self.c.fill_round_rect(cx as i32 - iw / 2, cy as i32 - ih / 2, iw, ih, ih as f32 / 2.0, col);
+            } else {
+                self.c.fill_circle(cx, cy, self.t.s(4.0) as f32, col);
+            }
+            self.hits.push(Hit { x, y: by, w: bw, h: bh, action: Action::MemBar(bar) });
+            x -= self.t.s(4.0);
         }
-        self.y += h + self.t.s(8.0);
+        self.y += h + self.t.s(6.0);
+    }
+
+    /// The parts of a whole as one rounded bar across the popup; hovering a part makes it
+    /// brighter and names it with its size and share.
+    fn stacked_bar(&mut self, slices: &[(String, u64, Color)]) {
+        let total: u64 = slices.iter().map(|s| s.1).sum();
+        if total == 0 {
+            return;
+        }
+        let h = self.t.s(12.0);
+        let y = self.y + self.t.s(2.0);
+        let r = h as f32 / 2.0;
+        let font = self.font(9.5, FW_NORMAL);
+        let mut x = 0i32;
+        let mut sum = 0u64;
+        let n = slices.len();
+        for (i, (label, v, col)) in slices.iter().enumerate() {
+            sum += *v;
+            let end = if i + 1 == n { self.w } else { (self.w as f64 * sum as f64 / total as f64).round() as i32 };
+            if end <= x {
+                continue;
+            }
+            let hovered = self.mouse.map_or(false, |(mx, my)| mx >= x && mx < end && my >= y - self.t.s(3.0) && my < y + h + self.t.s(3.0));
+            // brighter: lighter and, for a see-through part, more solid
+            let c = if hovered { lighten(*col).alpha(((col.a as f32 / 255.0) * 1.5 + 0.2).min(1.0)) } else { *col };
+            self.c.fill_round_rect_cols(0, y, self.w, h, r, x, end, c);
+            let pct = (*v as f64 / total as f64 * 100.0).round() as i32;
+            self.tips.push(Tip { ax: None, x, y: y - self.t.s(3.0), w: end - x, h: h + self.t.s(6.0), font, text: format!("{label}: {} ({pct}%)", format_bytes(*v)) });
+            x = end;
+        }
+        self.y = y + h + self.t.s(8.0);
     }
 
     fn section(&mut self, name: &str) {
@@ -1034,7 +1301,7 @@ impl Ui<'_> {
             if let Some(c) = copy {
                 self.hits.push(Hit { x, y: self.y, w, h, action: Action::Copy(c.clone()) });
                 let tip = if flash.is_some() { t("popup.copied") } else { t("popup.copy") };
-                self.tips.push(Tip { x, y: self.y, w, h, font: ft, text: tip });
+                self.tips.push(Tip { ax: None, x, y: self.y, w, h, font: ft, text: tip });
             }
             x += w;
             if x >= self.w {
@@ -1092,7 +1359,7 @@ impl Ui<'_> {
     /// Hovering the rows drawn since `from_y` shows `text` as a tooltip.
     fn hover_tip(&mut self, from_y: i32, text: String) {
         let font = self.font(9.5, FW_NORMAL);
-        self.tips.push(Tip { x: 0, y: from_y, w: self.w, h: self.y - from_y, font, text });
+        self.tips.push(Tip { ax: None, x: 0, y: from_y, w: self.w, h: self.y - from_y, font, text });
     }
 
     /// Make the rows drawn since `from_y` react to a click.
@@ -1140,6 +1407,7 @@ impl Ui<'_> {
         }
         let rect = (1, self.y + 1, self.w - 2, h - 2);
         self.y += h + self.t.s(6.0);
+        self.last_chart = rect;
         rect
     }
 
@@ -1147,6 +1415,50 @@ impl Ui<'_> {
     fn chart(&mut self, values: &[f32], h_dip: f32, color: Color) {
         let (x, y, w, h) = self.chart_box(h_dip);
         self.c.line_chart(x, y, w, h, values, color, color.alpha(0.3));
+    }
+
+    /// The values of the chart drawn last at the mouse: a dot where each of its `lines` (0..1, as
+    /// drawn, in its colour) crosses the mouse's column and a box with `text`, which gets the
+    /// index of that moment in a series of a given length (None when that series has none there).
+    fn probe(&mut self, lines: &[(&[f32], Color)], text: impl Fn(&dyn Fn(usize) -> Option<usize>) -> String) {
+        let (x, y, w, h) = self.last_chart;
+        self.charts.push((x, y, w, h));
+        let Some((mx, my)) = self.mouse else { return };
+        if mx < x || mx >= x + w || my < y || my >= y + h {
+            return;
+        }
+        let dx = mx - x;
+        let label = text(&|n| series_index(n, w, dx));
+        if label.is_empty() {
+            return;
+        }
+        // how long ago that moment was, from the longest of the lines: "−01:22 · Load: 34%"
+        let n = lines.iter().map(|l| l.0.len()).max().unwrap_or(0);
+        let label = match series_index(n, w, dx) {
+            Some(i) => format!("\u{2212}{} \u{00B7} {label}", ago(self.ages.0 + (n - 1 - i) as f32 * self.ages.1)),
+            None => label,
+        };
+        let (r, ring) = (self.t.s(1.5) as f32, self.t.s(0.6) as f32);
+        for (values, color) in lines {
+            let Some(i) = series_index(values.len(), w, dx) else { continue };
+            let cy = (y + h) as f32 - values[i].clamp(0.0, 1.0) * h as f32;
+            let cx = mx as f32 + 0.5;
+            // a ring in the text colour keeps the dot visible on its own fill
+            self.c.fill_circle(cx, cy, r + ring, self.t.text.alpha(0.85));
+            self.c.fill_circle(cx, cy, r, *color);
+        }
+        let font = self.font(9.5, FW_NORMAL);
+        self.tips.push(Tip { ax: Some(mx), x, y, w, h, font, text: label });
+    }
+
+    /// A 0..1 series filled, and a second 0..1 one over it as a bare line in its own colour
+    /// (GPU load and the video memory in use).
+    fn chart_with_line(&mut self, values: &[f32], line: &[f32], h_dip: f32, color: Color, line_color: Color) {
+        let (x, y, w, h) = self.chart_box(h_dip);
+        self.c.line_chart(x, y, w, h, values, color, color.alpha(0.3));
+        if !line.is_empty() {
+            self.c.line_chart(x, y, w, h, line, line_color, line_color.alpha(0.0));
+        }
     }
 
     /// Two series sharing an automatic scale (bytes/s etc).
@@ -1236,7 +1548,7 @@ impl Ui<'_> {
             if !tags.is_empty() {
                 name = format!("{name} ({})", tags.join(", "));
             }
-            self.tips.push(Tip { x: bx, y: y + pad, w: bw, h: max_h as i32, font: f, text: format!("{name}: {}", pct(*v)) });
+            self.tips.push(Tip { ax: None, x: bx, y: y + pad, w: bw, h: max_h as i32, font: f, text: format!("{name}: {}", pct(*v)) });
             bx += bw;
         }
     }
@@ -1379,7 +1691,7 @@ impl Ui<'_> {
                     self.c.draw_line(cx - r, cy - r, cx + r, cy + r, lw, col);
                     self.c.draw_line(cx - r, cy + r, cx + r, cy - r, lw, col);
                     let f = self.font(9.5, FW_NORMAL);
-                    self.tips.push(Tip { x: 0, y: iy, w: box_w, h: icon, font: f, text: t("popup.kill_process") });
+                    self.tips.push(Tip { ax: None, x: 0, y: iy, w: box_w, h: icon, font: f, text: t("popup.kill_process") });
                     self.hits.push(Hit { x: 0, y: iy, w: box_w, h: icon, action: Action::KillProc(p.pid) });
                 } else if let Some(img) = self.icons.get(p.pid, icon) {
                     let (w, h, px) = (img.w, img.h, img.px.clone());
@@ -1553,7 +1865,9 @@ fn draw_cpu(ui: &mut Ui, m: &MetricsData) {
         ui.title_list(&head(m, "popup.cpu"), "", &[(m.cpu_name.clone(), temp, ui.t.text, None)]);
     }
     let hist: Vec<f32> = m.cpu_history.iter().cloned().collect();
-    ui.chart(&hist, 70.0, ui.t.chart_color(Kind::Cpu, 0.0));
+    let cpu_color = ui.t.chart_color(Kind::Cpu, 0.0);
+    ui.chart(&hist, 70.0, cpu_color);
+    ui.probe(&[(&hist, cpu_color)], |at| at(hist.len()).map(|i| format!("{}: {}", t("popup.load"), pct(hist[i]))).unwrap_or_default());
     // the rows stay in place; which of them show with "More" closed is the user's choice (a click
     // on a label with it open), the diagnostics and fixed facts fold away by default
     let more = ui.expanded.contains("more:cpu");
@@ -1686,17 +2000,26 @@ fn draw_mem(ui: &mut Ui, m: &MetricsData) {
     }
     ui.title(&head(m, "popup.memory"), &sub(m, &line));
     let hist: Vec<f32> = m.mem_history.iter().cloned().collect();
-    ui.chart(&hist, 70.0, ui.t.chart_color(Kind::Mem, 0.0));
-    ui.row_colored(&t("popup.usage"), &pct(m.mem.pct), ui.t.usage(m.mem.pct, ui.t.text));
-    ui.row(&t("popup.used"), &format_bytes(m.mem.used));
-    ui.row(&t("popup.free"), &format_bytes(m.mem.total.saturating_sub(m.mem.used)));
-    ui.row(&t("popup.committed"), &format!("{} / {}", format_bytes(m.mem.commit_used), format_bytes(m.mem.commit_total)));
+    let mem_color = ui.t.chart_color(Kind::Mem, 0.0);
+    ui.chart(&hist, 70.0, mem_color);
+    let total = m.mem.total;
+    ui.probe(&[(&hist, mem_color)], |at| at(hist.len()).map(|i| format!("{}: {} \u{00B7} {}", t("popup.usage"), pct(hist[i]), format_bytes((hist[i].clamp(0.0, 1.0) as f64 * total as f64) as u64))).unwrap_or_default());
+    // the rows stay in place; which of them show with "More" closed is the user's choice
+    let more = ui.expanded.contains("more:mem");
+    ui.fold_open = more;
+    let text = ui.t.text;
+    ui.frow("mem.usage", true, &t("popup.usage"), &pct(m.mem.pct), ui.t.usage(m.mem.pct, text));
+    ui.frow("mem.used", true, &t("popup.used"), &format_bytes(m.mem.used), text);
+    ui.frow("mem.free", true, &t("popup.free"), &format_bytes(m.mem.total.saturating_sub(m.mem.used)), text);
+    ui.frow("mem.committed", true, &t("popup.committed"), &format!("{} / {}", format_bytes(m.mem.commit_used), format_bytes(m.mem.commit_total)), text);
     if m.sys.pagefile_total > 0 {
-        ui.row(&t("popup.pagefile"), &format!("{} / {}", format_bytes(m.sys.pagefile_used), format_bytes(m.sys.pagefile_total)));
+        ui.frow("mem.pagefile", false, &t("popup.pagefile"), &format!("{} / {}", format_bytes(m.sys.pagefile_used), format_bytes(m.sys.pagefile_total)), text);
     }
     if m.sys.hw_reserved >= 1024 * 1024 {
-        ui.row(&t("popup.hw_reserved"), &format_bytes(m.sys.hw_reserved));
+        ui.frow("mem.hw_reserved", false, &t("popup.hw_reserved"), &format_bytes(m.sys.hw_reserved), text);
     }
+    ui.flush_fold();
+    ui.more_toggle("more:mem", more);
     if m.mem_processes > 0 {
         // where the physical memory goes: process private sets, kernel pools, the rest of "used"
         // (driver-locked pages such as VM memory, shared/mapped pages, hardware reserved) and
@@ -1704,14 +2027,20 @@ fn draw_mem(ui: &mut Ui, m: &MetricsData) {
         let kernel = m.mem_kernel_paged + m.mem_kernel_nonpaged;
         let other = m.mem.used.saturating_sub(m.mem_processes).saturating_sub(kernel);
         let available = m.mem.total.saturating_sub(m.mem.used);
-        ui.section(&t("popup.where_it_goes"));
-        ui.pie(&[
+        ui.breakdown_section(&t("popup.where_it_goes"));
+        let parts = [
             // red, not the accent: a dark system accent vanishes on the dark popup
             (t("popup.processes_private"), m.mem_processes, Color::rgb(0xFF, 0x45, 0x3A)),
             (t("popup.kernel_pools"), kernel, Color::rgb(0xAF, 0x52, 0xDE)),
             (t("popup.other_memory"), other, Color::rgb(0xFF, 0x95, 0x00)),
             (t("popup.available_memory"), available, ui.t.dim.alpha(0.45)),
-        ]);
+        ];
+        // the pie with its legend, or just one bar whose parts name themselves on hover
+        if ui.mem_bar {
+            ui.stacked_bar(&parts);
+        } else {
+            ui.pie(&parts);
+        }
         ui.row(&t("popup.file_cache"), &format_bytes(m.mem_cache));
     }
     ui.proc_section(&t("popup.top_processes"), m.host.is_empty());
@@ -1736,14 +2065,38 @@ fn draw_gpu(ui: &mut Ui, m: &MetricsData) {
                 let right = if shown && a.dedicated >= 512 * 1024 * 1024 { temp.clone() } else { String::new() };
                 let color = if shown { ui.t.text } else { ui.t.dim };
                 let action = (several && !shown).then(|| Action::SelectGpu(a.name.clone()));
-                (a.name.clone(), right, color, action)
+                // the card's own memory next to its name: "AMD Radeon RX 9070 XT · 16 GB"
+                let name = match vram_size(a.dedicated) {
+                    Some(size) => format!("{} \u{00B7} {size}", a.name),
+                    None => a.name.clone(),
+                };
+                (name, right, color, action)
             })
             .collect();
         let key = if m.gpu_adapters.len() > 1 { "popup.gpus" } else { "popup.gpu" };
         ui.title_list(&head(m, key), "", &lines);
     }
+    // the load filled, the video memory in use as a line over it in the memory colour
     let hist: Vec<f32> = m.gpu_history.iter().cloned().collect();
-    ui.chart(&hist, 70.0, ui.t.chart_color(Kind::Gpu, 0.0));
+    let vram: Vec<f32> = m.vram_history.iter().cloned().collect();
+    let load_color = ui.t.chart_color(Kind::Gpu, 0.0);
+    // the memory module's colour, or orange where it is the same as the GPU's (both the accent)
+    let mem_color = ui.t.chart_color(Kind::Mem, 0.0);
+    let vram_color = if mem_color == load_color { Color::rgb(0xFF, 0x95, 0x00) } else { mem_color };
+    ui.chart_with_line(&hist, &vram, 70.0, load_color, vram_color);
+    // the video memory in bytes from the shown adapter's size (an agent sends its total)
+    let vram_size = m.gpu_primary.as_ref().map(|a| a.dedicated).filter(|d| *d > 0).unwrap_or(m.vram_total);
+    ui.probe(&[(&hist, load_color), (&vram, vram_color)], |at| {
+        let mut parts = Vec::new();
+        if let Some(i) = at(hist.len()) {
+            parts.push(format!("{}: {}", t("popup.load"), pct(hist[i])));
+        }
+        if let Some(i) = at(vram.len()) {
+            let used = (vram[i].clamp(0.0, 1.0) as f64 * vram_size as f64) as u64;
+            parts.push(format!("{}: {} ({})", t("popup.video_memory"), format_bytes(used), pct(vram[i])));
+        }
+        parts.join(" \u{00B7} ")
+    });
     // the rows stay in place; which of them show with "More" closed is the user's choice
     let more = ui.expanded.contains("more:gpu");
     ui.fold_open = more;
@@ -1850,8 +2203,27 @@ fn draw_gpu(ui: &mut Ui, m: &MetricsData) {
     // sends (Linux DRM fdinfo, NVML)
     let local = m.host.is_empty();
     if (local && m.gpu_available) || (!local && !m.top_gpu.is_empty()) {
-        ui.proc_section(&t("popup.gpu_processes"), local);
-        ui.processes(&m.top_gpu, ProcMode::Gpu, m.top_n, local);
+        // ordered by GPU load or by video memory (an agent sends its top by load: re-sorted here)
+        ui.proc_section_sorted(&t("popup.top_processes"), local, Some(ui.gpu_by_vram));
+        let mut list = m.top_gpu.clone();
+        if !local {
+            crate::metrics::processes::sort_gpu(&mut list, ui.gpu_by_vram);
+        }
+        ui.processes(&list, ProcMode::Gpu, m.top_n, local);
+    }
+}
+
+/// A card's own video memory as its box says it: whole gigabytes ("16 GB" for the 15.8 GiB
+/// Windows reports); None for an integrated GPU without memory of its own.
+fn vram_size(bytes: u64) -> Option<String> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let gib = bytes as f64 / GIB;
+    if gib >= 1.0 {
+        Some(format!("{} {}", gib.round() as u64, unit("gb")))
+    } else if bytes >= 512 * 1024 * 1024 {
+        Some(format_bytes(bytes))
+    } else {
+        None
     }
 }
 
@@ -1901,6 +2273,18 @@ fn draw_net(ui: &mut Ui, m: &MetricsData) {
     let tx: Vec<f32> = if show_tx { m.net_history.iter().map(|v| v.1).collect() } else { Vec::new() };
     let max = ui.chart2(&rx, &tx, 70.0, DOWN, UP, 10.0 * 1024.0);
     let (down, up) = (t("popup.download"), t("popup.upload"));
+    let scaled = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| x / max).collect() };
+    let (nrx, ntx) = (scaled(&rx), scaled(&tx));
+    ui.probe(&[(&nrx, DOWN), (&ntx, UP)], |at| {
+        let mut parts = Vec::new();
+        if let Some(i) = at(rx.len()) {
+            parts.push(format!("{down}: {}", rate(rx[i] as f64)));
+        }
+        if let Some(i) = at(tx.len()) {
+            parts.push(format!("{up}: {}", rate(tx[i] as f64)));
+        }
+        parts.join(" \u{00B7} ")
+    });
     ui.legend(&[(&down, ui.on_off(DOWN, show_rx)), (&up, ui.on_off(UP, show_tx)), (&tf("popup.scale", &[("rate", &rate(max as f64))]), ui.t.dim.alpha(0.0))]);
     let start = ui.y;
     ui.row_lv(&down, &rate(m.net_rx), ui.on_off(ui.t.dim, show_rx), ui.on_off(DOWN, show_rx));
@@ -1963,6 +2347,18 @@ fn draw_disk(ui: &mut Ui, m: &MetricsData) {
     let w: Vec<f32> = m.disk_history.iter().map(|v| v.1).collect();
     let max = ui.chart2(&r, &w, 70.0, READ, WRITE, 1024.0 * 1024.0);
     let (read, write) = (t("popup.read"), t("popup.write"));
+    let scaled = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| x / max).collect() };
+    let (nr, nw) = (scaled(&r), scaled(&w));
+    ui.probe(&[(&nr, READ), (&nw, WRITE)], |at| {
+        let mut parts = Vec::new();
+        if let Some(i) = at(r.len()) {
+            parts.push(format!("{read}: {}", format_bytes_rate(r[i] as f64)));
+        }
+        if let Some(i) = at(w.len()) {
+            parts.push(format!("{write}: {}", format_bytes_rate(w[i] as f64)));
+        }
+        parts.join(" \u{00B7} ")
+    });
     ui.legend(&[(&read, READ), (&write, WRITE), (&tf("popup.scale", &[("rate", &format_bytes_rate(max as f64))]), ui.t.dim.alpha(0.0))]);
     ui.row_colored(&read, &format_bytes_rate(m.disk_read), READ);
     ui.row_colored(&write, &format_bytes_rate(m.disk_write), WRITE);
@@ -2095,7 +2491,41 @@ fn draw_battery(ui: &mut Ui, m: &MetricsData) {
 
 #[cfg(test)]
 mod tests {
-    use super::{arrange, drop_slot, fmt_delta, fmt_temp, merge_order};
+    use super::{ago, arrange, drop_slot, fmt_delta, fmt_temp, held, merge_order, series_index};
+
+    #[test]
+    fn sample_ago() {
+        assert_eq!(ago(0.2), "00:00");
+        assert_eq!(ago(82.4), "01:22");
+        assert_eq!(ago(3909.0), "1:05:09");
+    }
+    use std::collections::VecDeque;
+
+    #[test]
+    fn held_chart_window() {
+        let snap: VecDeque<u32> = (1..=5).collect();
+        // three samples came while held; the live history dropped its oldest ones (full)
+        let live: VecDeque<u32> = (4..=8).collect();
+        // all three behind: the held picture; none behind: the live one; in between it scrolls
+        assert_eq!(held(&snap, &live, 3, 3), snap);
+        assert_eq!(held(&snap, &live, 3, 0), live);
+        assert_eq!(held(&snap, &live, 3, 1), (3..=7).collect::<VecDeque<u32>>());
+        // nothing held: live as it is
+        assert_eq!(held(&VecDeque::new(), &live, 3, 3), live);
+    }
+
+    #[test]
+    fn chart_probe_index() {
+        // 3 samples stretched over 101 px: the ends and the middle
+        assert_eq!(series_index(3, 101, 0), Some(0));
+        assert_eq!(series_index(3, 101, 50), Some(1));
+        assert_eq!(series_index(3, 101, 100), Some(2));
+        // 300 samples in 100 px: the newest 100, one per column
+        assert_eq!(series_index(300, 100, 0), Some(200));
+        assert_eq!(series_index(300, 100, 99), Some(299));
+        assert_eq!(series_index(0, 100, 5), None);
+        assert_eq!(series_index(1, 100, 70), Some(0));
+    }
 
     fn v(k: &[&str]) -> Vec<String> {
         k.iter().map(|s| s.to_string()).collect()

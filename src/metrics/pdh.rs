@@ -162,9 +162,9 @@ impl Pdh {
         }
     }
 
-    /// GPU load per process id, Task Manager style: per process the busiest engine type of any
-    /// adapter. Uses the last collected sample, so it costs no extra query.
-    pub fn gpu_by_pid(&self) -> HashMap<u32, f32> {
+    /// GPU load per (process id, adapter LUID), Task Manager style: the busiest engine type of
+    /// that process on that adapter. Uses the last collected sample, so it costs no extra query.
+    pub fn gpu_by_pid(&self) -> HashMap<(u32, u64), f32> {
         let Some(g) = self.gpu else { return HashMap::new() };
         let mut per: HashMap<(u32, u64, String), f64> = HashMap::new();
         for (name, v) in Self::array(g) {
@@ -172,10 +172,10 @@ impl Pdh {
             let engtype = name.rsplit("engtype_").next().unwrap_or("").to_string();
             *per.entry((pid, luid_of(&name), engtype)).or_default() += v;
         }
-        let mut out: HashMap<u32, f32> = HashMap::new();
-        for ((pid, _, _), v) in per {
+        let mut out: HashMap<(u32, u64), f32> = HashMap::new();
+        for ((pid, luid, _), v) in per {
             let v = (v / 100.0).clamp(0.0, 1.0) as f32;
-            let e = out.entry(pid).or_insert(0.0);
+            let e = out.entry((pid, luid)).or_insert(0.0);
             *e = e.max(v);
         }
         out
@@ -243,8 +243,8 @@ pub struct DetailSample {
     pub zone_temp: Option<f32>,
     /// per PhysicalDriveN index: (busy 0..1, queue length, ms per transfer, transfers/s)
     pub disks: Vec<(u32, f32, f32, f32, f32)>,
-    /// per process id: (dedicated, shared) GPU memory in bytes, summed over adapters
-    pub gpu_proc_mem: HashMap<u32, (u64, u64)>,
+    /// per (process id, adapter LUID): (dedicated, shared) GPU memory in bytes
+    pub gpu_proc_mem: HashMap<(u32, u64), (u64, u64)>,
     /// per adapter LUID: (dedicated, shared) GPU memory in use, bytes
     pub gpu_adapter_mem: HashMap<u64, (u64, u64)>,
 }
@@ -310,7 +310,7 @@ impl Details {
         let mut sum_pid = |c: Option<isize>, dedicated: bool| {
             for (name, v) in c.map(Pdh::array).unwrap_or_default() {
                 let Some(pid) = pid_of(&name) else { continue };
-                let e = s.gpu_proc_mem.entry(pid).or_default();
+                let e = s.gpu_proc_mem.entry((pid, luid_of(&name))).or_default();
                 if dedicated { e.0 += v.max(0.0) as u64 } else { e.1 += v.max(0.0) as u64 }
             }
         };

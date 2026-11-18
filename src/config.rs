@@ -54,6 +54,10 @@ pub struct Config {
     pub proc_show_user: bool,
     /// Popups whose "More" rows are open, e.g. "more:cpu"
     pub popup_more: Vec<String>,
+    /// "Where the memory goes" in the memory popup as one bar instead of the pie chart
+    pub mem_breakdown_bar: bool,
+    /// The GPU popup's process list ordered by video memory instead of GPU load
+    pub gpu_procs_by_vram: bool,
     /// How many times winstats has started (the agent hint waits for the second start)
     pub launches: u32,
     /// The "watch other computers too?" question was asked
@@ -144,6 +148,8 @@ impl Default for Config {
             proc_show_system: true,
             proc_show_user: true,
             popup_more: Vec::new(),
+            mem_breakdown_bar: false,
+            gpu_procs_by_vram: false,
             launches: 0,
             agent_hint_shown: false,
             popup_rows: Vec::new(),

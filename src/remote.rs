@@ -466,6 +466,7 @@ impl Agent {
             }
         }
         metrics::push(&mut d.cpu_history, d.cpu_total);
+        d.mark_sample();
         // memory
         d.mem.used = s.mem.used;
         if d.mem.total == 0 {
@@ -517,6 +518,9 @@ impl Agent {
             d.vram_used = g.vram_used;
             d.vram_total = g.vram_total;
             d.vram_budget = g.vram_total;
+            if g.vram_total > 0 {
+                metrics::push(&mut d.vram_history, (g.vram_used as f64 / g.vram_total as f64).clamp(0.0, 1.0) as f32);
+            }
             let p = &mut d.gpu_perf;
             p.temp = g.temp;
             p.hotspot = g.hotspot;

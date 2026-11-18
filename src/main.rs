@@ -297,6 +297,7 @@ fn main() {
     metrics.set_gpu_disabled(&cfg.gpu_disabled);
     metrics.proc_interval_ms = cfg.proc_update_ms;
     metrics.set_proc_filter(cfg.proc_show_system, cfg.proc_show_user);
+    metrics.set_gpu_by_vram(cfg.gpu_procs_by_vram);
     metrics.set_group_pe(cfg.group_pe_cores);
     if first_run {
         // do not start with widgets this machine cannot feed
@@ -316,6 +317,8 @@ fn main() {
     let widgets = widgets::build(&cfg.widgets);
     let mut popup = Popup::new(hinstance, "WinStatsPopup", backdrop::Opacity::from_config(&cfg.popup_opacity)).expect("popup window");
     popup.proc_filter = (cfg.proc_show_system, cfg.proc_show_user);
+    popup.mem_bar = cfg.mem_breakdown_bar;
+    popup.gpu_by_vram = cfg.gpu_procs_by_vram;
     for key in &cfg.popup_more {
         popup.toggle_expand(key.clone());
     }
@@ -1435,7 +1438,7 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         // the DWM-backed popup has a frame only to get the backdrop: no non-client area, no resizing
         WM_NCCALCSIZE if wparam.0 != 0 => LRESULT(0),
         WM_NCHITTEST => LRESULT(HTCLIENT as isize),
-        WM_TIMER if wparam.0 == popup::COPY_TIMER => {
+        WM_TIMER if wparam.0 == popup::COPY_TIMER || wparam.0 == popup::CHART_TIMER => {
             // copy flash frames; the render ends the timer when the flash is over
             with_app(|app| {
                 if app.popup.visible {
@@ -2195,29 +2198,105 @@ fn remote_token(entry: usize) {
 /// Ask for a new label for the machine in entry `entry` of the Remote submenu; an empty answer
 /// brings back the default one.
 fn edit_remote_label(entry: usize) {
-    let Some((key, name, current, dpi, above)) = with_app(|app| {
+    // the dialog's own background: the preview draws on it with matching colours
+    let window = unsafe { windows::Win32::Graphics::Gdi::GetSysColor(windows::Win32::Graphics::Gdi::COLOR_WINDOW) };
+    let bg = Color::rgb((window & 0xFF) as u8, ((window >> 8) & 0xFF) as u8, ((window >> 16) & 0xFF) as u8);
+    let light = bg.r as u32 + bg.g as u32 + bg.b as u32 > 3 * 128;
+    // the machine, its label, whether labels show, and the strip's theme for this machine
+    let Some((key, name, current, shown, theme, dpi, above)) = with_app(|app| {
         app.popup.hide("label");
         let key = app.menu_remote.get(entry)?.key.clone()?;
         let rc = app.cfg.remotes.get(&key)?;
         let current = if rc.label.is_empty() { default_label(&rc.name) } else { rc.label.clone() };
+        let theme = remote_theme(&app.cfg, &app.theme_for(light), &key);
         let (dpi, above) = dialog_anchor(app);
-        Some((key, rc.name.clone(), current, dpi, above))
+        Some((key, rc.name.clone(), current, rc.labels, theme, dpi, above))
     })
     .flatten() else {
         return;
     };
+    let fallback = default_label(&name);
+    // CPU, memory and GPU charts as on the strip with the label typed, fed with made-up data
+    // that drifts calmly
+    let mut sim = PreviewSim::new();
+    let preview: input::PreviewFn = Box::new(move |c: &mut Canvas, w: i32, h: i32, text: &str, show: bool, advance: bool| {
+        if advance {
+            sim.step();
+        }
+        c.resize(w.max(1), h.max(1));
+        c.clear();
+        c.fill_rect(0, 0, w, h, bg);
+        let mut t = theme.clone();
+        let text = text.trim();
+        t.label = Some(if text.is_empty() { fallback.clone() } else { text.chars().take(LABEL_MAX).collect() });
+        t.labels = show;
+        let charts = [widgets::Line(Kind::Cpu), widgets::Line(Kind::Mem), widgets::Line(Kind::Gpu)];
+        let gap = t.s(6.0);
+        let total: i32 = charts.iter().map(|wd| wd.width(c, &t, &sim.data)).sum::<i32>() + gap * (charts.len() as i32 - 1);
+        let mut x = ((w - total) / 2).max(0);
+        for wd in &charts {
+            wd.draw(c, x, (h - t.inner_h) / 2, &t, &sim.data);
+            x += wd.width(c, &t, &sim.data) + gap;
+        }
+    });
     let caption = tf("dialog.label_title", &[("name", &name)]);
-    let Some(text) = input::prompt(&caption, &t("dialog.label_prompt"), &current, LABEL_MAX, dpi, above, &t("dialog.ok"), &t("dialog.cancel")) else {
+    let extras = input::Extras { check: Some((t("menu.labels"), shown)), preview: Some(preview) };
+    let Some((text, show)) = input::prompt_ex(&caption, &t("dialog.label_prompt"), &current, LABEL_MAX, dpi, above, &t("dialog.ok"), &t("dialog.cancel"), extras) else {
         return;
     };
     with_app(|app| {
         if let Some(rc) = app.cfg.remotes.get_mut(&key) {
             let text = text.trim();
             rc.label = if text.is_empty() { default_label(&rc.name) } else { text.chars().take(LABEL_MAX).collect() };
+            rc.labels = show;
         }
         app.cfg.save();
         app.render();
     });
+}
+
+/// Made-up load for the label preview: CPU, memory and GPU each wander a little per step
+/// (memory least), never jumping across the scale.
+struct PreviewSim {
+    data: metrics::MetricsData,
+    seed: u64,
+    cpu: f32,
+    mem: f32,
+    gpu: f32,
+}
+
+impl PreviewSim {
+    fn new() -> Self {
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9E37_79B9, |d| d.as_nanos() as u64) | 1;
+        let mut s = PreviewSim { data: Default::default(), seed, cpu: 0.25, mem: 0.55, gpu: 0.15 };
+        // a full chart from the start
+        for _ in 0..90 {
+            s.step();
+        }
+        s
+    }
+
+    /// 0..1 from a xorshift
+    fn rand(&mut self) -> f32 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 7;
+        self.seed ^= self.seed << 17;
+        (self.seed >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    fn step(&mut self) {
+        let (a, b, c) = (self.rand(), self.rand(), self.rand());
+        self.cpu = (self.cpu + (a - 0.5) * 0.10).clamp(0.05, 0.85);
+        self.mem = (self.mem + (b - 0.5) * 0.02).clamp(0.35, 0.75);
+        self.gpu = (self.gpu + (c - 0.5) * 0.07).clamp(0.02, 0.70);
+        let d = &mut self.data;
+        d.cpu_total = self.cpu;
+        d.mem.pct = self.mem;
+        d.gpu = Some(self.gpu);
+        metrics::push(&mut d.cpu_history, self.cpu);
+        metrics::push(&mut d.mem_history, self.mem);
+        metrics::push(&mut d.gpu_history, self.gpu);
+    }
 }
 
 fn show_menu() {
@@ -2249,6 +2328,23 @@ impl App {
                 } else {
                     util::log("clipboard: copy failed");
                 }
+                return;
+            }
+            popup::Action::GpuSort(by_vram) => {
+                self.cfg.gpu_procs_by_vram = *by_vram;
+                self.cfg.save();
+                self.metrics.set_gpu_by_vram(*by_vram);
+                self.popup.gpu_by_vram = *by_vram;
+                self.render_popup(false);
+                return;
+            }
+            popup::Action::MemBar(bar) => {
+                self.cfg.mem_breakdown_bar = *bar;
+                self.cfg.save();
+                self.popup.mem_bar = *bar;
+                // the bar is lower than the pie: size the window to it again
+                self.popup.relayout();
+                self.render_popup(false);
                 return;
             }
             popup::Action::ProcFilter(system) => {

@@ -47,6 +47,14 @@ pub struct MetricsData {
     /// model name per socket (local only; drawn when there are several)
     pub cpu_socket_names: Vec<String>,
     pub cpu_history: VecDeque<f32>,
+    /// samples taken so far (one per history push): a held popup chart counts what it skipped
+    pub samples: u64,
+    /// when the last sample came, and the usual time between samples (ms): how long ago a
+    /// point of a history chart was
+    pub last_sample: Option<std::time::Instant>,
+    pub sample_ms: f32,
+    /// a held popup chart's view only: how many samples it lags behind the live histories
+    pub charts_behind: usize,
     pub mem_history: VecDeque<f32>,
     pub net_rx: f64,
     pub net_tx: f64,
@@ -70,6 +78,9 @@ pub struct MetricsData {
     pub drives: Vec<drives::Drive>,
     pub gpu: Option<f32>,
     pub gpu_history: VecDeque<f32>,
+    /// dedicated video memory in use of the shown adapter, 0..1 of its size, along `gpu_history`;
+    /// empty where the adapter does not report it
+    pub vram_history: VecDeque<f32>,
     pub gpu_name: String,
     pub gpu_adapters: Vec<gpu::AdapterInfo>,
     pub gpu_primary: Option<gpu::AdapterInfo>,
@@ -251,6 +262,13 @@ pub struct Metrics {
     /// load history of every adapter by LUID: switching adapters in the popup shows the chosen
     /// one's own past instead of continuing the previous one's line
     gpu_histories: std::collections::HashMap<u64, VecDeque<f32>>,
+    /// the same for the dedicated video memory in use, 0..1
+    vram_histories: std::collections::HashMap<u64, VecDeque<f32>>,
+    /// the GPU process list by video memory instead of load
+    gpu_by_vram: bool,
+    /// the last per-process GPU load and memory by adapter: another adapter chosen in the popup
+    /// gets its list at once
+    gpu_procs: Option<(std::collections::HashMap<(u32, u64), f32>, std::collections::HashMap<(u32, u64), (u64, u64)>)>,
 }
 
 impl Deref for Metrics {
@@ -325,6 +343,9 @@ impl Metrics {
             proc_at: None,
             procs_fresh: false,
             gpu_histories: Default::default(),
+            vram_histories: Default::default(),
+            gpu_by_vram: false,
+            gpu_procs: None,
         }
     }
 
@@ -362,6 +383,9 @@ impl Metrics {
         if let Some(h) = d.gpu_primary.as_ref().and_then(|p| self.gpu_histories.get(&p.luid)) {
             d.gpu_history = h.clone();
         }
+        d.vram_history = d.gpu_primary.as_ref().and_then(|p| self.vram_histories.get(&p.luid)).cloned().unwrap_or_default();
+        // the process list follows the chosen adapter
+        self.rebuild_gpu_procs();
     }
 
     pub fn set_disks_disabled(&mut self, disabled: &[String]) {
@@ -387,6 +411,21 @@ impl Metrics {
         self.procs.show_system = system;
         self.procs.show_user = user;
         self.proc_at = None;
+    }
+
+    /// The GPU process list of the adapter the popup shows, from the last per-process readings.
+    fn rebuild_gpu_procs(&mut self) {
+        let Some((load, mem)) = &self.gpu_procs else { return };
+        let filter = (self.procs.show_system, self.procs.show_user);
+        let luid = self.gpu_dev.primary().map(|a| a.luid);
+        self.data.top_gpu = processes::top_gpu(load, mem, &self.procs.names, filter, self.data.top_n, self.gpu_by_vram, luid);
+    }
+
+    /// Order of the GPU process list: by video memory or by load. The current list is re-sorted
+    /// at once; the next sample picks its top by the new order.
+    pub fn set_gpu_by_vram(&mut self, by_vram: bool) {
+        self.gpu_by_vram = by_vram;
+        processes::sort_gpu(&mut self.data.top_gpu, by_vram);
     }
 
     /// Rebuild the process lists now (after a filter change), without a new chart sample.
@@ -455,7 +494,10 @@ impl Metrics {
                     _ => None,
                 };
                 if let Some(load) = load {
-                    d.top_gpu = processes::top_gpu(&load, &sample.gpu_proc_mem, &self.procs.names, filter, d.top_n);
+                    // the list of the adapter the popup shows; kept for another one chosen there
+                    let luid = self.gpu_dev.primary().map(|a| a.luid);
+                    d.top_gpu = processes::top_gpu(&load, &sample.gpu_proc_mem, &self.procs.names, filter, d.top_n, self.gpu_by_vram, luid);
+                    self.gpu_procs = Some((load, sample.gpu_proc_mem.clone()));
                 }
             }
             self.gpu_dev.set_adapter_mem(&sample.gpu_adapter_mem);
@@ -498,6 +540,7 @@ impl Metrics {
         d.cpu_system = self.cpu.system;
         d.cpu_user = self.cpu.user;
         push(&mut d.cpu_history, d.cpu_total);
+        d.mark_sample();
 
         d.mem.update();
         push(&mut d.mem_history, d.mem.pct);
@@ -554,7 +597,15 @@ impl Metrics {
         for a in &self.gpu_dev.adapters {
             let v = if Some(a.luid) == primary { d.gpu } else { a.load };
             push(self.gpu_histories.entry(a.luid).or_default(), v.unwrap_or(0.0));
+            // video memory in use, for the line over the load chart; an adapter that has never
+            // reported it keeps no history (no line), one that skips a reading repeats the last
+            let used = a.dedicated_used.filter(|_| a.dedicated > 0).map(|u| (u as f64 / a.dedicated as f64).clamp(0.0, 1.0) as f32);
+            let h = self.vram_histories.entry(a.luid).or_default();
+            if let Some(v) = used.or_else(|| h.back().copied()) {
+                push(h, v);
+            }
         }
+        d.vram_history = primary.and_then(|l| self.vram_histories.get(&l)).cloned().unwrap_or_default();
         match primary.and_then(|l| self.gpu_histories.get(&l)) {
             Some(h) => d.gpu_history = h.clone(),
             None => push(&mut d.gpu_history, d.gpu.unwrap_or(0.0)),
@@ -604,6 +655,27 @@ impl Metrics {
 }
 
 /// Append to a bounded history.
+impl MetricsData {
+    /// A sample went into the histories: count it and keep the time between samples (smoothed,
+    /// so one late tick does not shift every timestamp).
+    pub fn mark_sample(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_sample {
+            let ms = now.duration_since(prev).as_secs_f32() * 1000.0;
+            self.sample_ms = if self.sample_ms > 0.0 { self.sample_ms * 0.8 + ms * 0.2 } else { ms };
+        }
+        self.last_sample = Some(now);
+        self.samples += 1;
+    }
+
+    /// How long ago sample `i` of an `n`-long history chart was taken, in seconds.
+    pub fn sample_age(&self, n: usize, i: usize) -> f32 {
+        let since = self.last_sample.map_or(0.0, |t| t.elapsed().as_secs_f32());
+        let step = if self.sample_ms > 0.0 { self.sample_ms / 1000.0 } else { 1.0 };
+        since + (n.saturating_sub(1 + i) + self.charts_behind) as f32 * step
+    }
+}
+
 pub fn push<T>(q: &mut VecDeque<T>, v: T) {
     if q.len() >= HISTORY {
         q.pop_front();

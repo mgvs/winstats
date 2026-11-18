@@ -209,14 +209,25 @@ impl Processes {
     }
 }
 
-/// The GPU list: per-process load (busiest engine) and GPU memory merged by image name like the
-/// other lists, busiest first; processes without GPU work or memory are left out.
-pub fn top_gpu(load: &HashMap<u32, f32>, mem: &HashMap<u32, (u64, u64)>, names: &HashMap<u32, (String, bool)>, filter: (bool, bool), n: usize) -> Vec<ProcInfo> {
+/// The GPU list of one adapter (`luid`; None: all of them): per-process load (busiest engine)
+/// and GPU memory on it, merged by image name like the other lists, busiest first (or the most
+/// video memory first, `by_vram`); processes without GPU work or memory there are left out.
+pub fn top_gpu(load: &HashMap<(u32, u64), f32>, mem: &HashMap<(u32, u64), (u64, u64)>, names: &HashMap<u32, (String, bool)>, filter: (bool, bool), n: usize, by_vram: bool, luid: Option<u64>) -> Vec<ProcInfo> {
+    let mine = |l: u64| luid.map_or(true, |want| want == l);
+    let mut per_pid: HashMap<u32, (f32, u64)> = HashMap::new();
+    for (&(pid, l), &g) in load {
+        if mine(l) {
+            let e = per_pid.entry(pid).or_default();
+            e.0 = e.0.max(g);
+        }
+    }
+    for (&(pid, l), m) in mem {
+        if mine(l) {
+            per_pid.entry(pid).or_default().1 += m.0 + m.1;
+        }
+    }
     let mut merged: HashMap<String, ProcInfo> = HashMap::new();
-    let pids: std::collections::HashSet<u32> = load.keys().chain(mem.keys()).cloned().collect();
-    for pid in pids {
-        let g = load.get(&pid).cloned().unwrap_or(0.0);
-        let v = mem.get(&pid).map(|m| m.0 + m.1).unwrap_or(0);
+    for (pid, (g, v)) in per_pid {
         if g <= 0.0 && v == 0 {
             continue;
         }
@@ -231,9 +242,19 @@ pub fn top_gpu(load: &HashMap<u32, f32>, mem: &HashMap<u32, (u64, u64)>, names: 
         e.vram += v;
     }
     let mut v: Vec<ProcInfo> = merged.into_values().collect();
-    v.sort_by(|a, b| b.gpu.partial_cmp(&a.gpu).unwrap_or(std::cmp::Ordering::Equal).then(b.vram.cmp(&a.vram)));
+    sort_gpu(&mut v, by_vram);
     v.truncate(n);
     v
+}
+
+/// GPU list order: the busiest first, or the most video memory first; the other one breaks ties.
+pub fn sort_gpu(v: &mut [ProcInfo], by_vram: bool) {
+    let load = |a: &ProcInfo, b: &ProcInfo| b.gpu.partial_cmp(&a.gpu).unwrap_or(std::cmp::Ordering::Equal);
+    if by_vram {
+        v.sort_by(|a, b| b.vram.cmp(&a.vram).then(load(a, b)));
+    } else {
+        v.sort_by(|a, b| load(a, b).then(b.vram.cmp(&a.vram)));
+    }
 }
 
 /// The account (SID bytes) of this process.
