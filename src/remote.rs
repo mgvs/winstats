@@ -625,7 +625,7 @@ fn bus_static(s: &str) -> &'static str {
 }
 
 fn adapter(i: usize, g: &winstats_proto::GpuInfo) -> AdapterInfo {
-    AdapterInfo { name: g.name.clone(), vendor_id: g.vendor_id, device_id: g.device_id, dedicated: g.vram_total, driver: g.driver.clone(), luid: i as u64 + 1, enabled: true, load: None, perf: Default::default(), dedicated_used: None, shared_used: None }
+    AdapterInfo { name: g.name.clone(), vendor_id: g.vendor_id, device_id: g.device_id, dedicated: g.vram_total, driver: g.driver.clone(), luid: i as u64 + 1, enabled: true, load: None, perf: Default::default(), dedicated_used: None, shared_used: None, d_state: None }
 }
 
 fn kind_static(s: &str) -> &'static str {

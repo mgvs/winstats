@@ -204,7 +204,11 @@ impl Intel {
             p.temp = unit(&t.gpu_temp, UNITS_CELSIUS).filter(|c| *c > 0.0 && *c < 150.0).map(|c| c as f32);
         }
         // board energy where the card reports it, else the GPU chip's; watts from the change
-        let energy = unit(&t.card_energy, UNITS_JOULES).or_else(|| unit(&t.gpu_energy, UNITS_JOULES));
+        let card = unit(&t.card_energy, UNITS_JOULES);
+        let energy = card.or_else(|| unit(&t.gpu_energy, UNITS_JOULES));
+        // without a board meter (integrated graphics) the counter is the graphics cores' alone:
+        // measured equal to the RAPL graphics rail (PP1) on an Arc 140T, idle and at full load
+        p.power_cores_only = card.is_none() && energy.is_some();
         let stamp = unit(&t.time_stamp, UNITS_SECONDS);
         if let (Some(e), Some(s)) = (energy, stamp) {
             if let Some((ps, pe)) = dev.2 {
@@ -223,6 +227,60 @@ impl Intel {
                 UNITS_PERCENT => p.fan_pct = f.get().filter(|r| (0.0..=100.0).contains(r)).map(|r| r as u32).or(p.fan_pct),
                 _ => {}
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `cargo test intel_power_probe -- --ignored --nocapture`: read-only. Prints the raw IGCL
+    /// energy / time stamp, the watts derived from them, and the RAPL graphics rail (PP1) and
+    /// package for comparison, once a second for 10 s.
+    #[test]
+    #[ignore]
+    fn intel_power_probe() {
+        let mut intel = Intel::new().expect("IGCL");
+        let mut meters = super::super::emi::Meters::open();
+        let luid = intel.devices[0].0;
+        let h = intel.devices[0].1;
+        let secs: usize = std::env::var("PROBE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let mut prev: Option<(f64, f64)> = None;
+        let mut prev_act: Option<(f64, f64)> = None;
+        for _ in 0..=secs {
+            let mut t: Telemetry = unsafe { std::mem::zeroed() };
+            t.size = std::mem::size_of::<Telemetry>() as u32;
+            t.version = 1;
+            let _ = unsafe { (intel.telemetry)(h, &mut t) };
+            let e = t.gpu_energy.get();
+            let c = t.card_energy.get();
+            let s = t.time_stamp.get();
+            let act = t.global_activity.get();
+            // activity counter: seconds busy; its rate is the utilisation
+            let util = match (prev_act, act, s) {
+                (Some((pa, ps)), Some(a), Some(s)) if s > ps => Some(((a - pa) / (s - ps) * 100.0).round()),
+                _ => None,
+            };
+            if let (Some(a), Some(s)) = (act, s) {
+                prev_act = Some((a, s));
+            }
+            let derived = match (prev, e, s) {
+                (Some((pe, ps)), Some(e), Some(s)) if s > ps => Some((e - pe) / (s - ps)),
+                _ => None,
+            };
+            if let (Some(e), Some(s)) = (e, s) {
+                prev = Some((e, s));
+            }
+            let m = meters.as_mut().map(|m| m.sample()).unwrap_or_default();
+            let w = |n: &str| m.iter().find(|c| c.name.ends_with(n)).map(|c| c.watts);
+            println!(
+                "{:>8.1}s busy {:>4?}% | IGCL {:?} W | RAPL PP1 {:?} W, PP0 {:?} W, PKG {:?} W  (card_energy {:?})",
+                s.unwrap_or(0.0) % 10000.0, util, derived.map(|v| (v * 100.0).round() / 100.0), w("_PP1"), w("_PP0"), w("_PKG"), c
+            );
+            let mut p = Perf::default();
+            intel.fill(luid, &mut p);
+            std::thread::sleep(std::time::Duration::from_millis(1000));
         }
     }
 }

@@ -13,6 +13,7 @@ mod popup;
 mod procicon;
 mod remote;
 mod share;
+mod style;
 mod taskbar;
 mod update;
 mod util;
@@ -85,6 +86,8 @@ struct App {
     zburst: u32,
     popup: Popup,
     about: About,
+    /// the battery charts in their own window
+    charts: popup::chart_window::ChartWindow,
     /// newer release found by the update check, shown in the menu
     update_available: Option<String>,
     remotes: remote::Remotes,
@@ -95,6 +98,8 @@ struct App {
     tip_items: Vec<(RECT, String)>,
     /// ICMP probe for the latency rows of the network popup
     ping: metrics::ping::Ping,
+    sleep: metrics::sleepdrain::SleepTracker,
+    keep_awake: bool,
     /// this machine served to other winstats (Remote > Share this machine)
     share: Option<share::Share>,
     /// agents listed in the last Remote submenu, in id order
@@ -195,7 +200,7 @@ fn agent_theme(cfg: &Config, base: &Theme, key: &str, stale: bool) -> Theme {
     if stale {
         let grey = base.dim.alpha(0.6);
         t.outline = None;
-        t.modes = [ColorMode::Fixed(grey); 6];
+        t.modes = [ColorMode::Fixed(grey); widgets::MODULE_COUNT];
         t.accent = grey;
         t.text = grey;
     }
@@ -262,6 +267,7 @@ fn main() {
         register_class(hinstance, "WinStatsPopup", Some(popup_wndproc));
         register_class(hinstance, "WinStatsShadow", Some(shadow_wndproc));
         register_class(hinstance, "WinStatsAbout", Some(about_wndproc));
+        register_class(hinstance, popup::chart_window::CLASS, Some(chart_wndproc));
     }
 
     let hidden = unsafe {
@@ -335,12 +341,15 @@ fn main() {
             zburst: 0,
             popup,
             about,
+            charts: popup::chart_window::ChartWindow::new(hinstance),
             update_available: None,
             remotes: remote::Remotes::new(),
             tips: HWND::default(),
             tip_bar: HWND::default(),
             tip_items: Vec::new(),
             ping: metrics::ping::Ping::new(&cfg.ping_host),
+            sleep: metrics::sleepdrain::SleepTracker::load(),
+            keep_awake: false,
             share: None,
             menu_remote: Vec::new(),
             menu_displays: Vec::new(),
@@ -520,25 +529,35 @@ impl App {
         // widget row: the taskbar's thickness; a vertical taskbar is wide (it shows labels), so
         // there the row is 48 DIP like an ordinary taskbar
         let h = if tb.vertical() { tb.thickness().min((48.0 * scale).round() as i32) } else { tb.thickness() };
+        let style = style::Style::from_config(&self.cfg.style);
         let (text, dim) = if light {
-            (Color::rgb(0x1B, 0x1B, 0x1B), Color::rgba(0x1B, 0x1B, 0x1B, 160))
+            (Color::rgb(0x1B, 0x1B, 0x1B), Color::rgba(0x1B, 0x1B, 0x1B, style.dim_alpha(true)))
         } else {
-            (WHITE, Color::rgba(255, 255, 255, 150))
+            (WHITE, Color::rgba(255, 255, 255, style.dim_alpha(false)))
         };
         let _ = BLACK;
-        let mut modes = [ColorMode::Accent; 6];
+        let mut modes = [ColorMode::Accent; widgets::MODULE_COUNT];
         for (i, k) in widgets::MODULES.iter().enumerate() {
+            // colours set per module win; then the style's own; then the accent
             modes[i] = match self.cfg.colors.get(module_key(*k)) {
                 Some(v) => ColorMode::parse(v),
                 None if self.cfg.utilization_colors && *k == Kind::Cpu => ColorMode::Utilization,
-                None => ColorMode::Accent,
+                None if style.mono() => ColorMode::Mono,
+                None => match style.module_colors(light) {
+                    Some(c) => c.get(i).copied().map_or(ColorMode::Accent, ColorMode::Fixed),
+                    None => ColorMode::Accent,
+                },
             };
         }
         Theme {
             text,
             dim,
             // a colour too close to the background (white on light, black on dark) is shifted
-            accent: widgets::readable(self.cfg.accent_color(), light),
+            accent: match style.system_accent().then(|| util::system_accent_for(light)).flatten() {
+                // the shade Windows uses on this background: already readable
+                Some(c) => c,
+                None => widgets::readable(if style.system_accent() { widgets::named_color("system").unwrap_or(widgets::BLUE) } else { self.cfg.accent_color() }, light),
+            },
             outline: widgets::named_color(if light { &self.cfg.outline_light } else { &self.cfg.outline_dark }),
             light,
             scale,
@@ -553,6 +572,17 @@ impl App {
             net_bits: self.cfg.net_unit == "bits",
             net_upload_first: self.cfg.net_upload_first,
             temp_f: self.cfg.temp_unit == "fahrenheit",
+            animate: match self.cfg.animation_mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => self.cfg.animations && util::animations_enabled(),
+            },
+            style,
+            battery_hours: match self.cfg.battery_history_hours {
+                // 0 = since unplugged; 72 / 168 = 3 / 7 days (the large view)
+                h @ (0 | 1 | 6 | 24 | 72 | 168) => h,
+                _ => 6,
+            },
             modes,
             label: None,
         }
@@ -582,6 +612,25 @@ impl App {
             None => Some((&mut self.cfg.popup_rows, &mut self.cfg.popup_order)),
             Some(key) => self.cfg.remotes.get_mut(&key).map(|rc| (&mut rc.popup_rows, &mut rc.popup_order)),
         }
+    }
+
+    fn show_charts(&mut self) {
+        let (theme, light) = (self.popup_theme(), self.is_light());
+        self.charts.show(&theme, light, &self.metrics);
+    }
+
+    /// New data for the chart window: drawn on its next paint.
+    fn render_charts(&mut self) {
+        self.charts.refresh();
+    }
+
+    /// WM_PAINT of the chart window: redraw if out of date, then show it.
+    fn paint_charts(&mut self) {
+        if self.charts.dirty() {
+            let (theme, light) = (self.popup_theme(), self.is_light());
+            self.charts.render(&theme, light, &self.metrics);
+        }
+        self.charts.paint();
     }
 
     fn render_popup(&mut self, first: bool) {
@@ -627,8 +676,17 @@ impl App {
         let share_details = self.share.as_ref().map_or(false, |s| s.details_wanted());
         // a master looking at this machine gets the GPU sensors and per-process use too
         self.metrics.gpu_details = (self.popup.visible && self.popup.source.is_none() && self.popup.kind == Some(Kind::Gpu)) || share_details;
+        self.metrics.control_details = self.popup.visible && self.popup.source.is_none() && self.popup.kind == Some(Kind::Battery);
+        // the power worker samples fast only while the local battery or CPU popup is open
+        let power_open = self.popup.visible && self.popup.source.is_none() && matches!(self.popup.kind, Some(Kind::Battery) | Some(Kind::Cpu));
+        if let Some(p) = self.metrics.power_mon.as_ref() {
+            p.set_active(power_open, self.cfg.update_ms);
+        }
         let started = std::time::Instant::now();
-        self.metrics.update((self.popup.visible && self.popup.source.is_none()) || share_details);
+        // per-process sampling only for the popups that list processes (it is the heaviest part
+        // of a tick, and it runs on the thread that also animates the battery flow)
+        let lists = matches!(self.popup.kind, Some(Kind::Cpu) | Some(Kind::Mem) | Some(Kind::Gpu) | Some(Kind::Disk));
+        self.metrics.update((self.popup.visible && self.popup.source.is_none() && lists) || share_details);
         // latency probe only while the local network popup is open
         let net_open = self.popup.visible && self.popup.source.is_none() && self.popup.kind == Some(Kind::Net);
         self.ping.set(net_open, &self.cfg.ping_host);
@@ -637,6 +695,18 @@ impl App {
         self.metrics.net_ping_host = if self.cfg.ping_host.is_empty() || target.is_empty() { self.cfg.ping_host.clone() } else { target };
         self.metrics.net_latency = lat;
         self.metrics.net_jitter = jit;
+        // standby tracking
+        let now_unix = util::now_unix();
+        if let Some(b) = self.metrics.data.battery {
+            let mwh = self.metrics.data.power_tel.as_ref().filter(|t| now_unix.saturating_sub(t.at_unix) <= 10 && !t.cells.is_empty() && !t.cells.iter().any(|c| c.relative)).and_then(|t| {
+                let caps: Vec<u32> = t.cells.iter().filter_map(|c| c.capacity_mwh).collect();
+                (caps.len() == t.cells.len()).then(|| caps.iter().sum())
+            });
+            if self.sleep.update(now_unix, b.level, mwh, b.on_ac) || self.metrics.data.sleeps.len() != self.sleep.events.len() {
+                self.metrics.data.sleeps = self.sleep.events.clone();
+            }
+        }
+        self.metrics.data.keep_awake = self.keep_awake;
         if let Some(s) = self.share.as_mut() {
             s.publish(&self.cfg, &self.metrics);
         }
@@ -651,6 +721,7 @@ impl App {
         if !self.fullscreen_hidden {
             self.render();
         }
+        self.render_charts();
         // the whole tick runs on the UI thread: anything slow here is a visible stall
         let ms = started.elapsed().as_millis();
         if ms > 250 {
@@ -975,6 +1046,10 @@ impl App {
             match source {
                 None => {
                     self.metrics.gpu_details = kind == Kind::Gpu;
+                    self.metrics.control_details = kind == Kind::Battery;
+                    if kind == Kind::Battery {
+                        self.metrics.read_controls();
+                    }
                     self.metrics.begin_details()
                 }
                 Some(key) => self.remotes.request_details(&key, self.cfg.top_processes as usize),
@@ -1151,6 +1226,9 @@ impl App {
         unsafe {
             let _ = DestroyWindow(self.popup.hwnd);
             let _ = DestroyWindow(self.about.hwnd);
+            if !self.charts.hwnd.is_invalid() {
+                let _ = DestroyWindow(self.charts.hwnd);
+            }
             if IsWindow(self.bar).as_bool() {
                 let _ = DestroyWindow(self.bar);
             }
@@ -1332,6 +1410,78 @@ unsafe extern "system" fn about_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
     }
 }
 
+/// The battery charts window: resizable, follows the mouse on the charts, Esc closes it.
+unsafe extern "system" fn chart_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let xy = |l: LPARAM| ((l.0 & 0xFFFF) as i16 as i32, ((l.0 >> 16) & 0xFFFF) as i16 as i32);
+    match msg {
+        WM_PAINT => {
+            if with_app(|app| app.paint_charts()).is_none() {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_SIZE => {
+            with_app(|app| app.render_charts());
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            let mmi = lparam.0 as *mut MINMAXINFO;
+            if !mmi.is_null() {
+                unsafe {
+                    (*mmi).ptMinTrackSize = POINT { x: 520, y: 480 };
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            unsafe {
+                let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            let p = xy(lparam);
+            with_app(|app| {
+                if app.charts.mouse_at(Some(p)) {
+                    app.charts.invalidate();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_app(|app| {
+                if app.charts.mouse_at(None) {
+                    app.charts.invalidate();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = xy(lparam);
+            with_app(|app| {
+                if let Some(a) = app.charts.click(x, y) {
+                    app.popup_action(a);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+            unsafe {
+                let _ = SetCursor(LoadCursorW(None, IDC_ARROW).unwrap_or_default());
+            }
+            LRESULT(1)
+        }
+        WM_KEYDOWN if wparam.0 == 0x1B => {
+            with_app(|app| app.charts.hide());
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            with_app(|app| app.charts.hide());
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
 /// The popup's shadow window: nothing to handle, it never gets input.
 unsafe extern "system" fn shadow_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1435,6 +1585,22 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         // the DWM-backed popup has a frame only to get the backdrop: no non-client area, no resizing
         WM_NCCALCSIZE if wparam.0 != 0 => LRESULT(0),
         WM_NCHITTEST => LRESULT(HTCLIENT as isize),
+        WM_MOUSEWHEEL => {
+            // a popup taller than the screen scrolls: three rows per notch
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            with_app(|app| {
+                let step = app.popup_theme().s(66.0);
+                if app.popup.visible && app.popup.scroll_by(-delta * step / 120) {
+                    app.render_popup(false);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == popup::ANIM_TIMER => {
+            // power-flow frames: only the band region is redrawn
+            with_app(|app| app.popup.animate());
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == popup::COPY_TIMER => {
             // copy flash frames; the render ends the timer when the flash is over
             with_app(|app| {
@@ -1501,6 +1667,8 @@ const MENU_ACCENT_BASE: usize = 450;
 /// outline colour for the current (light or dark) strip: MENU_OUTLINE_BASE = the theme's grey,
 /// then one entry per palette colour
 const MENU_OUTLINE_BASE: usize = 660;
+/// visual style: MENU_STYLE_BASE + index in style::STYLES
+const MENU_STYLE_BASE: usize = 1900;
 const MENU_FONT_BASE: usize = 470;
 const MENU_CHART_BASE: usize = 480;
 const MENU_TOP_BASE: usize = 490;
@@ -1510,6 +1678,9 @@ const MENU_NET_BITS: usize = 511;
 const MENU_TEMP_CELSIUS: usize = 512;
 const MENU_TEMP_FAHRENHEIT: usize = 513;
 const MENU_NET_UPLOAD_FIRST: usize = 514;
+const MENU_ANIM_AUTO: usize = 515;
+const MENU_ANIM_ON: usize = 516;
+const MENU_ANIM_OFF: usize = 517;
 /// language: MENU_LANG_BASE = system language, then one entry per locale
 const MENU_LANG_BASE: usize = 600;
 /// Remote submenu: the discovery toggle, then one block of ids per listed agent
@@ -1847,6 +2018,12 @@ unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
         menu_item(theme, MENU_THEME_LIGHT, &t("menu.theme_light"), cfg.theme == "light");
         menu_submenu(settings, theme, &t("menu.theme"));
 
+        let styles = CreatePopupMenu().ok()?;
+        for (i, (value, key)) in style::STYLES.iter().enumerate() {
+            menu_item(styles, MENU_STYLE_BASE + i, &t(key), style::Style::from_config(&cfg.style) == style::Style::from_config(value));
+        }
+        menu_submenu(settings, styles, &t("menu.style"));
+
         let opacity = CreatePopupMenu().ok()?;
         for (i, (value, key)) in POPUP_OPACITY.iter().enumerate() {
             menu_item(opacity, MENU_OPACITY_BASE + i, &t(key), cfg.popup_opacity == *value);
@@ -1856,6 +2033,14 @@ unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
         menu_item(temps, MENU_TEMP_CELSIUS, &t("menu.celsius"), cfg.temp_unit != "fahrenheit");
         menu_item(temps, MENU_TEMP_FAHRENHEIT, &t("menu.fahrenheit"), cfg.temp_unit == "fahrenheit");
         menu_submenu(settings, temps, &t("menu.temp_units"));
+        let anim = CreatePopupMenu().ok()?;
+        let mode = cfg.animation_mode.as_str();
+        let windows_on = util::animations_enabled();
+        let auto_label = format!("{}  ({})", t("menu.anim_auto"), t(if windows_on { "menu.anim_windows_on" } else { "menu.anim_windows_off" }));
+        menu_item(anim, MENU_ANIM_AUTO, &auto_label, mode != "on" && mode != "off");
+        menu_item(anim, MENU_ANIM_ON, &t("menu.anim_on"), mode == "on");
+        menu_item(anim, MENU_ANIM_OFF, &t("menu.anim_off"), mode == "off");
+        menu_submenu(settings, anim, &t("menu.animations"));
 
         let lang = CreatePopupMenu().ok()?;
         menu_item(lang, MENU_LANG_BASE, &t("menu.lang_system"), cfg.language == "auto");
@@ -2007,7 +2192,9 @@ fn menu_sticky(id: u32) -> bool {
     let id = id as usize;
     match id {
         MENU_EXIT | MENU_CONFIG | MENU_RELOAD | MENU_TASKMGR | MENU_ABOUT | MENU_CHECK_UPDATE | MENU_GET_UPDATE | MENU_REMOTE_ADD | MENU_REMOTE_INSTALL => false,
-        c if (MENU_DISPLAY_BASE..MENU_REMOTE_BASE).contains(&c) => false,
+        // the Display entries (not the whole range up to the remote machines: the style menu
+        // at MENU_STYLE_BASE stays open like the other settings)
+        c if (MENU_DISPLAY_BASE..MENU_DISPLAY_BASE + 100).contains(&c) => false,
         c if c >= MENU_REMOTE_BASE => !matches!((c - MENU_REMOTE_BASE) % MENU_REMOTE_STRIDE, RM_CONNECT | RM_FORGET | RM_EDIT_LABEL | RM_EDIT_TOKEN),
         _ => true,
     }
@@ -2242,6 +2429,39 @@ impl App {
     /// A click on a toggling row in the popup: flip the item in the config, save, re-render.
     fn popup_action(&mut self, action: popup::Action) {
         match &action {
+            popup::Action::OpenUri(uri) => {
+                self.popup.hide("open settings");
+                util::open_uri(uri);
+                return;
+            }
+            popup::Action::KeepAwake(on) => {
+                metrics::quick::set_keep_awake(*on);
+                self.keep_awake = *on;
+                self.metrics.data.keep_awake = *on;
+                self.render_popup(false);
+                return;
+            }
+            popup::Action::ScreenOff(on_ac, secs) => {
+                metrics::quick::set_screen_timeout(*on_ac, *secs);
+                self.metrics.data.screen_off = metrics::quick::screen_timeouts();
+                self.render_popup(false);
+                return;
+            }
+            popup::Action::Track => {
+                // a click on a history chart: the charts in their own window, the popup steps back
+                if self.popup.source.is_none() {
+                    self.popup.hide("charts");
+                    self.show_charts();
+                }
+                return;
+            }
+            popup::Action::BatteryRange(hours) => {
+                self.cfg.battery_history_hours = *hours;
+                self.cfg.save();
+                self.render_popup(false);
+                self.render_charts();
+                return;
+            }
             popup::Action::Copy(text) => {
                 if util::set_clipboard(text) {
                     self.popup.flash_copied(text);
@@ -2535,6 +2755,15 @@ impl App {
             MENU_NET_UPLOAD_FIRST => self.cfg.net_upload_first = !self.cfg.net_upload_first,
             MENU_TEMP_CELSIUS => self.cfg.temp_unit = "celsius".into(),
             MENU_TEMP_FAHRENHEIT => self.cfg.temp_unit = "fahrenheit".into(),
+            MENU_ANIM_AUTO | MENU_ANIM_ON | MENU_ANIM_OFF => {
+                self.cfg.animation_mode = match cmd {
+                    MENU_ANIM_ON => "on",
+                    MENU_ANIM_OFF => "off",
+                    _ => "auto",
+                }
+                .into();
+                self.cfg.animations = true;
+            }
             c if (MENU_MOVE_BASE..MENU_MOVE_BASE + widgets::MODULES.len() * 2).contains(&c) => {
                 let mi = (c - MENU_MOVE_BASE) / 2;
                 let dir = if (c - MENU_MOVE_BASE) % 2 == 0 { -1 } else { 1 };
@@ -2598,6 +2827,14 @@ impl App {
             MENU_THEME_AUTO => self.cfg.theme = "auto".into(),
             MENU_THEME_DARK => self.cfg.theme = "dark".into(),
             MENU_THEME_LIGHT => self.cfg.theme = "light".into(),
+            c if (MENU_STYLE_BASE..MENU_STYLE_BASE + style::STYLES.len()).contains(&c) => {
+                self.cfg.style = style::STYLES[c - MENU_STYLE_BASE].0.into();
+                // the styles paint their own background over the system material
+                if style::Style::from_config(&self.cfg.style) != style::Style::Classic {
+                    self.cfg.popup_opacity = "system".into();
+                    self.popup.opacity = backdrop::Opacity::from_config(&self.cfg.popup_opacity);
+                }
+            }
             c if (MENU_OPACITY_BASE..MENU_OPACITY_BASE + POPUP_OPACITY.len()).contains(&c) => {
                 self.cfg.popup_opacity = POPUP_OPACITY[c - MENU_OPACITY_BASE].0.into();
                 self.popup.opacity = backdrop::Opacity::from_config(&self.cfg.popup_opacity);
@@ -2643,3 +2880,4 @@ impl App {
         self.tick();
     }
 }
+

@@ -1,9 +1,9 @@
 //! Click popup: a top-level layered window anchored to the clicked widget
 //! showing details for that module. Content is drawn with the same Canvas as the strip.
 
-use crate::canvas::{Canvas, Color, FW_NORMAL, FW_SEMIBOLD, FontSpec, GREEN, RED, YELLOW};
+use crate::canvas::{Canvas, Color, FW_NORMAL, FW_SEMIBOLD, FontSpec, RED, YELLOW};
 use crate::metrics::MetricsData;
-use crate::util::{format_bytes, format_bytes_rate, format_duration, format_net_rate, pcwstr, unit, wide};
+use crate::util::{format_bytes, format_bytes_rate, format_net_rate, pcwstr, unit, wide};
 use crate::i18n::{t, tf};
 use crate::widgets::{Kind, Theme};
 use std::time::Instant;
@@ -11,6 +11,14 @@ use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 use windows::Win32::Foundation::{HINSTANCE, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetDC, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, PAINTSTRUCT, ReleaseDC};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+#[path = "popup_battery.rs"]
+mod battery_view;
+#[path = "popup_cards.rs"]
+mod cards;
+#[path = "popup_chart.rs"]
+pub mod chart_window;
+
 
 const WIDTH_DIP: f32 = 300.0;
 const PAD_DIP: f32 = 14.0;
@@ -24,6 +32,17 @@ pub const WRITE: Color = Color::rgb(0xFF, 0x98, 0x00);
 
 /// timer id of the copy flash on the popup window
 pub const COPY_TIMER: usize = 7;
+/// timer id of the power-flow animation frames (battery popup)
+pub const ANIM_TIMER: usize = 8;
+/// ms between animation frames (~30 fps); each frame redraws the flow bands only
+/// One frame per tick of Windows' 15.6 ms timer: about 64 frames a second (16 would round up
+/// to every second tick, 32 frames). The motion is time-based, so the frames' small jitter
+/// does not show.
+const ANIM_FRAME_MS: u32 = 15;
+/// process rows kept when a popup has to shrink to fit the screen
+const MIN_ROWS: usize = 3;
+/// popup width of the battery module, which carries the power-flow diagram
+const BATTERY_WIDTH_DIP: f32 = 780.0;
 const COPY_FLASH_SECS: f32 = 0.8;
 
 /// Geometry of the last drawn pie chart, in window coordinates, for hover hit-testing.
@@ -61,6 +80,16 @@ pub enum Action {
     MoveRows(Vec<String>),
     /// SYS (true) / USER (false) filter button of the process lists
     ProcFilter(bool),
+    /// open a URI (Windows settings pages)
+    OpenUri(String),
+    /// hours shown by the battery history charts
+    BatteryRange(u32),
+    /// keep the PC and screen awake
+    KeepAwake(bool),
+    /// screen-off timeout: on AC (true) or battery, seconds (0 = never)
+    ScreenOff(bool, u32),
+    /// a chart that shows a cursor at the mouse: redrawn on every mouse move over it
+    Track,
 }
 
 /// A clickable row rectangle, in content coords.
@@ -238,7 +267,29 @@ pub struct Popup {
     /// for re-creating the window: DWM does not take a backdrop change on a window that has had one
     hinstance: HINSTANCE,
     class: String,
+    /// power-flow bands of the last render, redrawn alone by the animation frames
+    anim: Option<battery_view::FlowAnim>,
+    /// content and window pixels under the bands, without them
+    anim_bg_content: Vec<u32>,
+    anim_bg_canvas: Vec<u32>,
+    /// where the band rectangle lands in the window canvas
+    anim_at: (i32, i32),
+    anim_running: bool,
+    anim_epoch: Instant,
+    /// the flow bands' continuous motion (battery popup)
+    motion: battery_view::FlowMotion,
+    /// content scrolled out at the top (px), the most it can be, and the visible content height
+    scroll: i32,
+    max_scroll: i32,
+    view_h: i32,
+    /// frames, paint seconds, present seconds, since
+    anim_stats: (u32, f64, f64, Instant),
+    /// full redraws and their seconds since the last stats line
+    render_stats: (u32, f64),
+    /// window position of the last render (layered windows are presented there)
+    win_pos: (i32, i32),
 }
+
 
 /// The popup window with the background for `opacity`; returns it with the mode in use and the
 /// native mode, which drops to Layered when DWM refuses every backdrop.
@@ -329,6 +380,19 @@ impl Popup {
             light: false,
             locked_h: 0,
             shape: None,
+            anim: None,
+            anim_bg_content: Vec::new(),
+            anim_bg_canvas: Vec::new(),
+            anim_at: (0, 0),
+            anim_running: false,
+            anim_epoch: Instant::now(),
+            motion: Default::default(),
+            scroll: 0,
+            max_scroll: 0,
+            view_h: 0,
+            anim_stats: (0, 0.0, 0.0, Instant::now()),
+            render_stats: (0, 0.0),
+            win_pos: (0, 0),
         })
     }
 
@@ -357,6 +421,7 @@ impl Popup {
         self.kind = Some(kind);
         self.widget = Some(widget);
         self.source = source;
+        self.scroll = 0;
         self.anchor = anchor;
         self.tray = tray;
         self.visible = true;
@@ -437,7 +502,10 @@ impl Popup {
     }
 
     fn hit_at(&self, x: i32, y: i32) -> Option<&Hit> {
-        let (cx, cy) = (x - self.pad, y - self.pad);
+        let (cx, cy) = (x - self.pad, y - self.pad + self.scroll);
+        if !self.in_view(y) {
+            return None;
+        }
         self.hits.iter().find(|h| cx >= h.x && cx < h.x + h.w && cy >= h.y && cy < h.y + h.h)
     }
 
@@ -502,14 +570,31 @@ impl Popup {
             }
             self.visible = false;
             self.hidden_at = Some(Instant::now());
+            self.stop_anim();
             self.press = None;
         }
     }
 
     /// Mouse moved over the popup (window coords): returns true when the hovered slice or
     /// truncated label changed.
+    /// Window y inside the visible content (not the padding a scrolled list runs under).
+    fn in_view(&self, y: i32) -> bool {
+        self.max_scroll == 0 || (y >= self.pad && y < self.pad + self.view_h)
+    }
+
+    /// Scroll by `px` (mouse wheel); true when the view moved.
+    pub fn scroll_by(&mut self, px: i32) -> bool {
+        let to = (self.scroll + px).clamp(0, self.max_scroll);
+        let moved = to != self.scroll;
+        self.scroll = to;
+        if moved {
+            self.tip = None;
+        }
+        moved
+    }
+
     pub fn mouse_move(&mut self, x: i32, y: i32) -> bool {
-        let (cx, cy) = (x - self.pad, y - self.pad);
+        let (cx, cy) = (x - self.pad, y - self.pad + self.scroll);
         let tip = self.tips.iter().position(|t| cx >= t.x && cx < t.x + t.w && cy >= t.y && cy < t.y + t.h);
         let mut changed = false;
         if let Some(p) = &mut self.press {
@@ -530,6 +615,10 @@ impl Popup {
         let over = self.hits.iter().position(|h| cx >= h.x && cx < h.x + h.w && cy >= h.y && cy < h.y + h.h);
         if over != self.hit_hover {
             self.hit_hover = over;
+            changed = true;
+        }
+        // a chart with a cursor follows the mouse
+        if over.map_or(false, |i| matches!(self.hits[i].action, Action::Track)) {
             changed = true;
         }
         let hit = self.pie.as_ref().and_then(|p| {
@@ -599,13 +688,33 @@ impl Popup {
     }
 
     pub fn render(&mut self, t: &Theme, light: bool, m: &MetricsData, first: bool) {
+        let t_render = Instant::now();
+        self.render_inner(t, light, m, first);
+        self.render_stats.0 += 1;
+        self.render_stats.1 += t_render.elapsed().as_secs_f64();
+    }
+
+    fn render_inner(&mut self, t: &Theme, light: bool, m: &MetricsData, first: bool) {
         let Some(kind) = self.kind else { return };
         if !self.visible {
             return;
         }
         self.light = light;
-        let w = t.s(WIDTH_DIP);
         let pad = t.s(PAD_DIP);
+        let work_w = {
+            let pt = windows::Win32::Foundation::POINT { x: (self.anchor.left + self.anchor.right) / 2, y: (self.anchor.top + self.anchor.bottom) / 2 };
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            unsafe {
+                let _ = GetMonitorInfoW(windows::Win32::Graphics::Gdi::MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi);
+            }
+            mi.rcWork.right - mi.rcWork.left
+        };
+        let w = match kind {
+            Kind::Battery => t.s(BATTERY_WIDTH_DIP),
+            _ => t.s(WIDTH_DIP),
+        };
+        // never wider than the screen
+        let w = if work_w > 0 { w.min(work_w - t.s(16.0)) } else { w };
         // the layered window gets no DWM shadow: a soft one is painted around the card instead
         let layered = self.native == crate::backdrop::Mode::Layered;
         let blur = t.s(SHADOW_DIP);
@@ -620,6 +729,8 @@ impl Popup {
                     }
                     (self.hwnd, self.backdrop, self.native) = (hwnd, backdrop, native);
                     self.applied = None;
+                    // the timer died with the old window
+                    self.anim_running = false;
                 }
             }
             let key = (self.backdrop, !light, self.opacity);
@@ -634,47 +745,106 @@ impl Popup {
             self.shape = shape;
             self.locked_h = 0;
         }
-        // pass 1: content on a tall transparent canvas
-        self.content.resize(w - pad * 2, t.s(900.0));
-        self.content.clear();
+        // pass 1: content on a transparent canvas. The canvas grows to the layout (a fixed
+        // height cut long popups off and left their reserved rows empty), and a popup that would
+        // not fit on the screen shows fewer process rows instead of running off the bottom.
         let copied = self.copy_progress();
-        let mut ui = Ui { c: &mut self.content, t, w: w - pad * 2, y: 0, hover: self.hover, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut self.icons, indent: 0, locks: &mut self.locks, frozen: &mut self.frozen, expanded: &self.expanded, proc_filter: self.proc_filter, mouse: self.mouse, copied, flipped: &self.rows_flipped, fold_open: false, fold: Vec::new(), order: &self.row_order, drag: self.press.as_ref().filter(|p| p.dragging).map(|p| (p.key.clone(), p.cy)), frows: Vec::new() };
-        match kind {
-            Kind::Cpu => draw_cpu(&mut ui, m),
-            Kind::Mem => draw_mem(&mut ui, m),
-            Kind::Gpu => draw_gpu(&mut ui, m),
-            Kind::Net => draw_net(&mut ui, m),
-            Kind::Disk => draw_disk(&mut ui, m),
-            Kind::Battery => draw_battery(&mut ui, m),
-        }
-        // layout cursor, not painted pixels: reserved (empty) rows count too
-        let end_y = ui.y;
-        // pie geometry from content coords to window coords
-        self.pie = ui.pie.take().map(|mut p| {
-            p.cx += (sh + pad) as f32;
-            p.cy += (sh + pad) as f32;
-            p
-        });
-        self.tips = std::mem::take(&mut ui.tips);
-        self.hits = std::mem::take(&mut ui.hits);
-        self.frows = std::mem::take(&mut ui.frows);
+        let phase = self.anim_epoch.elapsed().as_secs_f32();
+        let avail = {
+            let pt = windows::Win32::Foundation::POINT { x: (self.anchor.left + self.anchor.right) / 2, y: (self.anchor.top + self.anchor.bottom) / 2 };
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            unsafe {
+                let _ = GetMonitorInfoW(windows::Win32::Graphics::Gdi::MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi);
+            }
+            let work = mi.rcWork.bottom - mi.rcWork.top;
+            if work > 0 { work - t.s(8.0) * 2 - pad * 2 } else { i32::MAX }
+        };
+        let mut canvas_h = t.s(900.0);
+        let mut max_rows: Option<usize> = None;
+        let mut attempt = 0;
+        let end_y = loop {
+            attempt += 1;
+            self.content.resize(w - pad * 2, canvas_h);
+            self.content.clear();
+            let mut ui = Ui { c: &mut self.content, t, w: w - pad * 2, y: 0, hover: self.hover, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut self.icons, indent: 0, locks: &mut self.locks, frozen: &mut self.frozen, expanded: &self.expanded, proc_filter: self.proc_filter, mouse: self.mouse, copied: copied.clone(), anim: None, anim_bg: Vec::new(), phase, max_rows, flipped: &self.rows_flipped, fold_open: false, fold: Vec::new(), order: &self.row_order, drag: self.press.as_ref().filter(|p| p.dragging).map(|p| (p.key.clone(), p.cy)), frows: Vec::new() };
+            match kind {
+                Kind::Cpu => draw_cpu(&mut ui, m),
+                Kind::Mem => draw_mem(&mut ui, m),
+                Kind::Gpu => draw_gpu(&mut ui, m),
+                Kind::Net => draw_net(&mut ui, m),
+                Kind::Disk => draw_disk(&mut ui, m),
+                Kind::Battery => battery_view::draw(&mut ui, m),
+            }
+            // layout cursor, not painted pixels: reserved (empty) rows count too
+            let y = ui.y;
+            if attempt < 10 {
+                // the canvas first: a popup without process rows (battery) only scrolls, and
+                // spending the attempts on rows that change nothing cut its content off
+                if y > canvas_h {
+                    canvas_h = y + t.s(16.0);
+                    continue;
+                }
+                if y > avail {
+                    let cur = max_rows.unwrap_or(m.top_n);
+                    let row = t.s(22.0);
+                    let next = cur.saturating_sub(((y - avail + row - 1) / row) as usize).max(MIN_ROWS);
+                    if next < cur {
+                        max_rows = Some(next);
+                        continue;
+                    }
+                }
+            }
+            self.anim = ui.anim.take();
+            self.anim_bg_content = std::mem::take(&mut ui.anim_bg);
+            // pie geometry from content coords to window coords
+            self.pie = ui.pie.take().map(|mut p| {
+                p.cx += (sh + pad) as f32;
+                p.cy += (sh + pad) as f32;
+                p
+            });
+            self.tips = std::mem::take(&mut ui.tips);
+            self.hits = std::mem::take(&mut ui.hits);
+            // the fold rows drawn, for dragging them
+            self.frows = std::mem::take(&mut ui.frows);
+            break y;
+        };
         self.pad = sh + pad;
+        // the bands come off the content: they are drawn straight into the window below, at the
+        // running motion's state (a render does not restart them). Under a tooltip they stay in
+        // the content, so the tooltip covers them.
+        if let Some(a) = self.anim.clone() {
+            self.motion.retarget(&a);
+            self.content.put_region(a.x, a.y, a.w, a.h, &self.anim_bg_content);
+            if !self.anim_in_view(&a) {
+                battery_view::paint_smooth(&mut self.content, &a, &mut self.motion, (0.0, 0.0));
+            }
+        }
         if self.tip.map_or(false, |i| i >= self.tips.len()) {
             self.tip = None;
         }
         self.draw_tooltip(t, light, w - pad * 2);
         let content_h = end_y.max(self.content.used_height()).max(t.s(40.0));
-        // never shrink while open; grow only if content really needs more room
-        let h = (content_h + pad * 2).max(self.locked_h);
+        // never shrink while open; grow only if content really needs more room (and never past
+        // the screen: a height locked before a shorter layout must not leave a gap)
+        let h = (content_h + pad * 2).max(self.locked_h).min((content_h + pad * 2).max(avail + pad * 2));
+        // taller than the screen: the window stops at the screen, the content scrolls
+        let h = h.min(avail + pad * 2);
         self.locked_h = h;
+        self.view_h = h - pad * 2;
+        self.max_scroll = (content_h - self.view_h).max(0);
+        self.scroll = self.scroll.clamp(0, self.max_scroll);
 
         // pass 2: background + content
         self.canvas.resize(w + sh * 2, h + sh * 2);
         self.canvas.clear();
-        let card = |a: u8| if light { Color::rgba(0xF9, 0xF9, 0xF9, a) } else { Color::rgba(0x20, 0x20, 0x20, a) };
-        let bg = card(self.opacity.card_alpha());
+        // the style's own tint, else the opacity setting's theme fill
+        let (tint, overlay) = match t.style.popup_fill(light) {
+            Some((c, a)) => (c, a),
+            None => (if light { Color::rgb(0xF9, 0xF9, 0xF9) } else { Color::rgb(0x20, 0x20, 0x20) }, self.opacity.overlay()),
+        };
+        let card = |a: u8| Color { a, ..tint };
+        let bg = card(self.opacity.card_alpha().max((overlay * 255.0).round() as u8));
         let r = t.s(RADIUS_DIP) as f32;
-        let overlay = self.opacity.overlay();
         if self.backdrop == crate::backdrop::Mode::System && overlay > 0.0 {
             // the system material cannot be thickened: a theme fill over it does that
             self.canvas.fill_rect(0, 0, w, h, card((overlay * 255.0).round() as u8));
@@ -686,7 +856,26 @@ impl Popup {
             self.canvas.fill_round_rect(sh, sh, w, h, r, bg);
             self.canvas.stroke_round_rect_r(sh, sh, w, h, r, t.dim.alpha(0.35));
         }
-        self.canvas.blit(&self.content, sh + pad, sh + pad);
+        // the visible part of the content (all of it unless it scrolls)
+        self.canvas.blit_rect(&self.content, 0, self.scroll, w - pad * 2, self.view_h, sh + pad, sh + pad);
+        if self.max_scroll > 0 {
+            // a thin scroll bar in the right padding
+            let track = self.view_h;
+            let thumb = (track as i64 * track as i64 / (content_h as i64).max(1)) as i32;
+            let ty = sh + pad + ((track - thumb) as i64 * self.scroll as i64 / self.max_scroll.max(1) as i64) as i32;
+            let bw = t.s(3.0);
+            self.canvas.fill_round_rect(sh + w - pad / 2 - bw / 2, ty, bw, thumb.max(t.s(24.0)), bw as f32 / 2.0, t.dim.alpha(0.5));
+        }
+        if let Some(a) = self.anim.clone() {
+            // the finished window under the bands (without them): each frame copies it back and
+            // draws the bands on it, no blending of the whole area again
+            self.anim_at = (sh + pad + a.x, sh + pad + a.y - self.scroll);
+            self.anim_bg_canvas = self.canvas.copy_region(self.anim_at.0, self.anim_at.1, a.w, a.h);
+            if self.anim_in_view(&a) {
+                let off = ((self.anim_at.0 - a.x) as f32, (self.anim_at.1 - a.y) as f32);
+                battery_view::paint_smooth(&mut self.canvas, &a, &mut self.motion, off);
+            }
+        }
 
         // position: above (or below) the taskbar, centred on the clicked widget
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -716,6 +905,7 @@ impl Popup {
         unsafe {
             let flags = if first { SWP_SHOWWINDOW } else { SWP_SHOWWINDOW | SWP_NOACTIVATE };
             let (x, y) = (x - sh, y - sh);
+            self.win_pos = (x, y);
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w + sh * 2, h + sh * 2, flags);
             if layered {
                 if let Err(e) = self.canvas.present_at(self.hwnd, x, y) {
@@ -746,6 +936,75 @@ impl Popup {
                 let _ = SetForegroundWindow(self.hwnd);
             }
         }
+        // frames only while something flows and motion is welcome
+        let want = self.anim.as_ref().map_or(false, |a| a.moving() || self.motion.gliding()) && t.animate;
+        if want && !self.anim_running {
+            self.anim_running = true;
+            unsafe {
+                SetTimer(self.hwnd, ANIM_TIMER, ANIM_FRAME_MS, None);
+            }
+        } else if !want {
+            self.stop_anim();
+        }
+    }
+
+    /// The bands can be drawn straight into the window: no tooltip over them, fully in view.
+    fn anim_in_view(&self, a: &battery_view::FlowAnim) -> bool {
+        self.tip.is_none() && (self.max_scroll == 0 || (a.y >= self.scroll && a.y + a.h <= self.scroll + self.view_h))
+    }
+
+    fn stop_anim(&mut self) {
+        if self.anim_running {
+            self.anim_running = false;
+            unsafe {
+                let _ = KillTimer(self.hwnd, ANIM_TIMER);
+            }
+        }
+    }
+
+    /// One animation frame: put back the pixels under the flow bands, draw the bands at the new
+    /// phase and present. The rest of the popup is not touched.
+    pub fn animate(&mut self) {
+        let Some(a) = self.anim.as_ref() else {
+            self.stop_anim();
+            return;
+        };
+        if !self.visible {
+            self.stop_anim();
+            return;
+        }
+        // a tooltip may cover the bands, or they are scrolled partly out: keep the frame still
+        if !self.anim_in_view(&a.clone()) {
+            return;
+        }
+        let t0 = Instant::now();
+        let a = a.clone();
+        let (cx, cy) = self.anim_at;
+        self.canvas.put_region(cx, cy, a.w, a.h, &self.anim_bg_canvas);
+        battery_view::paint_smooth(&mut self.canvas, &a, &mut self.motion, ((cx - a.x) as f32, (cy - a.y) as f32));
+        let t1 = Instant::now();
+        // only the bands' rect goes to the screen, not the whole popup
+        unsafe {
+            if self.native == crate::backdrop::Mode::Layered {
+                let _ = self.canvas.present_region(self.hwnd, self.win_pos.0, self.win_pos.1, cx, cy, a.w, a.h);
+            } else {
+                let hdc = GetDC(self.hwnd);
+                self.canvas.paint_dc_region(hdc, cx, cy, a.w, a.h);
+                ReleaseDC(self.hwnd, hdc);
+            }
+        }
+        // frame cost, logged every 5 s while animating
+        let st = &mut self.anim_stats;
+        st.0 += 1;
+        st.1 += (t1 - t0).as_secs_f64();
+        st.2 += t1.elapsed().as_secs_f64();
+        if st.3.elapsed().as_secs() >= 5 {
+            let secs = st.3.elapsed().as_secs_f64();
+            let rs = self.render_stats;
+            crate::log!("anim: {:.0} fps, paint {:.2} ms, present {:.2} ms per frame, area {}x{}; {} redraws of {:.1} ms", st.0 as f64 / secs, st.1 * 1000.0 / st.0 as f64, st.2 * 1000.0 / st.0 as f64, a.w, a.h, rs.0, rs.1 * 1000.0 / rs.0.max(1) as f64);
+            self.render_stats = (0, 0.0);
+            *st = (0, 0.0, 0.0, Instant::now());
+        }
     }
 }
 
@@ -771,6 +1030,14 @@ struct Ui<'a> {
     mouse: Option<(i32, i32)>,
     /// text just copied and the flash progress 0..1
     copied: Option<(String, f32)>,
+    /// animated flow bands drawn by this render (battery popup)
+    anim: Option<battery_view::FlowAnim>,
+    /// content pixels under the bands before they were drawn
+    anim_bg: Vec<u32>,
+    /// animation clock, seconds
+    phase: f32,
+    /// process rows that fit on the screen; None = as configured
+    max_rows: Option<usize>,
     /// rows of the "More" folds moved from their default place
     flipped: &'a std::collections::HashSet<String>,
     /// the "More" fold of the popup being drawn is open: every `frow` shows, a click on a label
@@ -1096,6 +1363,12 @@ impl Ui<'_> {
     }
 
     /// Make the rows drawn since `from_y` react to a click.
+    /// A tooltip for any content rect.
+    fn tips_for_rect(&mut self, x: i32, y: i32, w: i32, h: i32, text: String) {
+        let font = self.font(9.5, FW_NORMAL);
+        self.tips.push(Tip { x, y, w, h, font, text });
+    }
+
     fn clickable(&mut self, from_y: i32, action: Action) {
         self.hits.push(Hit { x: 0, y: from_y, w: self.w, h: self.y - from_y, action });
     }
@@ -1131,12 +1404,18 @@ impl Ui<'_> {
 
     fn chart_box(&mut self, h_dip: f32) -> (i32, i32, i32, i32) {
         let h = self.t.s(h_dip);
-        let r = self.t.s(4.0) as f32;
-        self.c.fill_round_rect(0, self.y, self.w, h, r, self.t.dim.alpha(0.08));
-        self.c.stroke_round_rect_r(0, self.y, self.w, h, r, self.t.dim.alpha(0.25));
+        // the card language of the popups: soft fill, faint outline, quiet grid
+        let r = self.t.s(6.0) as f32;
+        let (fill, stroke) = self.t.style.card(self.t.light);
+        if self.t.style == crate::style::Style::Classic {
+            self.c.fill_round_rect(0, self.y, self.w, h, r, self.t.dim.alpha(0.06));
+        } else {
+            self.c.fill_round_rect(0, self.y, self.w, h, r, fill);
+        }
+        self.c.stroke_round_rect_r(0, self.y, self.w, h, r, stroke.unwrap_or(self.t.dim.alpha(0.2)));
         for q in [0.25f32, 0.5, 0.75] {
             let gy = self.y + (h as f32 * q).round() as i32;
-            self.c.fill_rect(1, gy, self.w - 2, 1, self.t.dim.alpha(0.12));
+            self.c.fill_rect(2, gy, self.w - 4, 1, self.t.dim.alpha(0.08));
         }
         let rect = (1, self.y + 1, self.w - 2, h - 2);
         self.y += h + self.t.s(6.0);
@@ -1146,7 +1425,8 @@ impl Ui<'_> {
     /// Single 0..1 series.
     fn chart(&mut self, values: &[f32], h_dip: f32, color: Color) {
         let (x, y, w, h) = self.chart_box(h_dip);
-        self.c.line_chart(x, y, w, h, values, color, color.alpha(0.3));
+        let lw = self.t.s(1.5) as f32;
+        self.c.area_chart(x, y, w, h, values, color, self.t.style.chart_fill(), lw);
     }
 
     /// Two series sharing an automatic scale (bytes/s etc).
@@ -1155,8 +1435,10 @@ impl Ui<'_> {
         let na: Vec<f32> = a.iter().map(|v| v / max).collect();
         let nb: Vec<f32> = b.iter().map(|v| v / max).collect();
         let (x, y, w, h) = self.chart_box(h_dip);
-        self.c.line_chart(x, y, w, h, &na, ca, ca.alpha(0.3));
-        self.c.line_chart(x, y, w, h, &nb, cb, cb.alpha(0.3));
+        let lw = self.t.s(1.5) as f32;
+        let fill = self.t.style.chart_fill() * 0.8;
+        self.c.area_chart(x, y, w, h, &na, ca, fill, lw);
+        self.c.area_chart(x, y, w, h, &nb, cb, fill, lw);
         max
     }
 
@@ -1302,6 +1584,8 @@ impl Ui<'_> {
     /// lists get the executable's icon in front of the name; a click pins the row and turns the
     /// icon into a kill button (remote machines only send names).
     fn processes(&mut self, list: &[crate::metrics::processes::ProcInfo], mode: ProcMode, n: usize, local: bool) {
+        // fewer rows when the popup would not fit on the screen
+        let n = self.max_rows.map_or(n, |m| n.min(m)).max(1);
         let text_h = self.c.measure_text("X", self.font(11.0, FW_NORMAL)).1;
         let icon = if local { self.t.s(16.0) } else { 0 };
         // at 100% scaling the text is barely taller than an icon, so keep some air between icons
@@ -1870,7 +2154,7 @@ fn adapter_mem(a: &crate::metrics::gpu::AdapterInfo) -> String {
     parts.join(" \u{00B7} ")
 }
 
-/// Watts without a fraction, but with one below 10 W (an SoC's GPU draws a fraction of a watt).
+/// Watts without a fraction above 10 W, one decimal below, two below 1 W.
 fn watts(w: f32) -> String {
     if w < 10.0 {
         format!("{w:.1}")
@@ -2042,54 +2326,6 @@ fn draw_disk(ui: &mut Ui, m: &MetricsData) {
         }
         let col = if frac > 0.9 { RED } else if frac > 0.8 { YELLOW } else { ui.t.accent };
         ui.bar_row(&label, frac, &format_bytes(d.free), col);
-    }
-}
-
-fn draw_battery(ui: &mut Ui, m: &MetricsData) {
-    let Some(b) = m.battery else {
-        ui.title(&head(m, "popup.battery"), &sub(m, &t("popup.no_battery")));
-        return;
-    };
-    let state = if b.charging {
-        t("popup.charging")
-    } else if b.on_ac {
-        t("popup.plugged_in")
-    } else {
-        t("popup.discharging")
-    };
-    ui.title(&head(m, "popup.battery"), &sub(m, &state));
-    let col = if b.charging || b.on_ac {
-        GREEN
-    } else if b.level < 0.15 {
-        RED
-    } else if b.level < 0.3 {
-        YELLOW
-    } else {
-        ui.t.accent
-    };
-    ui.bar_row(&t("popup.level"), b.level, &pct(b.level), col);
-    if let Some(s) = b.remaining_secs {
-        ui.row(&t("popup.time_remaining"), &format_duration(s));
-    }
-    if let Some(d) = m.battery_detail {
-        ui.section(&t("popup.details"));
-        if d.rate_mw != 0 {
-            ui.row(&t("popup.power"), &format!("{:.1} {}", d.rate_mw.abs() as f32 / 1000.0, unit("w")));
-        }
-        if d.max_mwh > 0 {
-            ui.row(&t("popup.capacity"), &format!("{:.1} / {:.1} {}", d.remaining_mwh as f32 / 1000.0, d.max_mwh as f32 / 1000.0, unit("wh")));
-        }
-        // wear: "112.2 Wh · 99%" (full now against new)
-        if d.design_mwh > 0 {
-            let mut text = format!("{:.1} {}", d.design_mwh as f32 / 1000.0, unit("wh"));
-            if d.max_mwh > 0 {
-                text.push_str(&format!(" · {}", pct(d.max_mwh as f32 / d.design_mwh as f32)));
-            }
-            ui.row(&t("popup.design_capacity"), &text);
-        }
-        if let Some(c) = d.cycles {
-            ui.row(&t("popup.cycles"), &c.to_string());
-        }
     }
 }
 

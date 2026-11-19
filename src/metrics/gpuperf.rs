@@ -33,6 +33,9 @@ pub struct Perf {
     pub power: Option<f32>,
     /// board power and its enforced limit, W (vendor libraries)
     pub power_w: Option<f32>,
+    /// `power_w` covers the graphics cores only, not the whole GPU (Intel integrated graphics
+    /// without a board meter: display, media and memory run elsewhere on the chip)
+    pub power_cores_only: bool,
     pub power_limit_w: Option<f32>,
     pub fan_rpm: Option<u32>,
     /// fan duty, percent (vendor libraries)
@@ -61,6 +64,8 @@ impl Perf {
             power: self.power.or(prev.power),
             power_w: self.power_w.or(prev.power_w),
             power_limit_w: self.power_limit_w.or(prev.power_limit_w),
+            // goes with the power value it describes
+            power_cores_only: if self.power_w.is_some() { self.power_cores_only } else { prev.power_cores_only },
             fan_rpm: self.fan_rpm.or(prev.fan_rpm),
             fan_pct: self.fan_pct.or(prev.fan_pct),
             mem_bw: self.mem_bw.or(prev.mem_bw),
