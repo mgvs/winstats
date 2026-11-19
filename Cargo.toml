@@ -1,6 +1,6 @@
 [package]
 name = "winstats"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 rust-version = "1.77"
 description = "System resource widgets embedded in the Windows taskbar"
