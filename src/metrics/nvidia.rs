@@ -138,8 +138,11 @@ impl Nvml {
             let mut v = 0u32;
             (unsafe { f(dev, &mut v) } == 0).then_some(v)
         };
-        p.power_w = get(self.power).filter(|mw| *mw > 0 && *mw < 2_000_000).map(|mw| mw as f32 / 1000.0).or(p.power_w);
+        // the limit first: a card that just woke from D3 reports nonsense once (588 W in P8 on a
+        // 4090 Laptop GPU limited to 80 W), and anything far above the enforced limit is that
         p.power_limit_w = get(self.limit).filter(|mw| *mw > 0 && *mw < 2_000_000).map(|mw| mw as f32 / 1000.0).or(p.power_limit_w);
+        let cap_mw = p.power_limit_w.map_or(2_000_000, |w| (w * 1500.0) as u32);
+        p.power_w = get(self.power).filter(|mw| *mw > 0 && *mw < 2_000_000 && *mw <= cap_mw).map(|mw| mw as f32 / 1000.0).or(p.power_w);
         p.pcie_gen = get(self.gen).filter(|g| (1..=7).contains(g)).or(p.pcie_gen);
         p.pcie_width = get(self.width).filter(|w| (1..=32).contains(w)).or(p.pcie_width);
         p.pcie_max_gen = get(self.max_gen).filter(|g| (1..=7).contains(g)).or(p.pcie_max_gen);

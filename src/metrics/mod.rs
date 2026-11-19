@@ -316,7 +316,7 @@ impl Metrics {
         let pdh = pdh::Pdh::new();
         // WINSTATS_WIN7_GPU: take the Windows 7 path (no GPU Engine counters) for testing
         let pdh_gpu = pdh.as_ref().map(|p| p.gpu_available()).unwrap_or(false) && std::env::var_os("WINSTATS_WIN7_GPU").is_none();
-        let gpu_stats = if pdh_gpu { None } else { gpustats::GpuStats::new(&gpu_dev.adapters.iter().map(|a| a.luid).collect::<Vec<_>>()).map(gpustats::GpuStatsWorker::start) };
+        let gpu_stats = if pdh_gpu { None } else { gpustats::GpuStats::new(&gpu_dev.all_luids()).map(gpustats::GpuStatsWorker::start) };
         if gpu_stats.is_some() {
             crate::log!("GPU load from D3DKMT statistics");
         }

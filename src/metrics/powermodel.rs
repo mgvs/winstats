@@ -68,12 +68,15 @@ pub struct Obs {
     pub brightness: f32,
     /// per slot: None = panel dark / inactive, Some(picture level) = lit
     pub lit: [Option<Option<f32>>; SLOTS],
+    /// a discrete graphics card is awake (D0): its draw is outside the model's terms, so such
+    /// stretches are not learned (they would be taken for base, conversion or a screen)
+    pub dgpu_awake: bool,
 }
 
 impl Obs {
     /// what must stay the same for a stretch to be steady
-    fn state_key(&self) -> (bool, bool, [bool; SLOTS], u32) {
-        (self.on_battery, self.valid, self.lit.map(|l| l.is_some()), (self.brightness * 20.0).round() as u32)
+    fn state_key(&self) -> (bool, bool, [bool; SLOTS], u32, bool) {
+        (self.on_battery, self.valid, self.lit.map(|l| l.is_some()), (self.brightness * 20.0).round() as u32, self.dgpu_awake)
     }
 }
 
@@ -239,7 +242,7 @@ impl Model {
         let steady = o.at >= self.steady_since + STEADY_SECS && self.window.len() >= 3;
         let estimate = self.predict(&x, &key.2);
         self.last_parts = self.parts(&x, &key.2);
-        if o.on_battery && o.valid && steady && y.is_finite() && o.at >= self.last_learn + LEARN_EVERY {
+        if o.on_battery && o.valid && !o.dgpu_awake && steady && y.is_finite() && o.at >= self.last_learn + LEARN_EVERY {
             self.last_learn = o.at;
             // the learning curve: how far the model as it stood was off, before it learns
             if let Some(th) = self.theta {
@@ -434,7 +437,7 @@ mod tests {
                 let pkg = pkg + (r % 3) as f32 * 2.0;
                 for _ in 0..30 {
                     at += 10;
-                    m.observe(Obs { at, on_battery: true, valid: true, battery_w: Some(truth(pkg, *b, lit)), pkg_w: Some(pkg), brightness: *b, lit: *lit });
+                    m.observe(Obs { at, on_battery: true, valid: true, battery_w: Some(truth(pkg, *b, lit)), pkg_w: Some(pkg), brightness: *b, lit: *lit, dgpu_awake: false });
                 }
             }
         }
@@ -461,13 +464,13 @@ mod tests {
             let mut ac = Model::from_text(&m.to_text()).unwrap();
             let mut est = None;
             for i in 0..10 {
-                est = ac.observe(Obs { at: at + 1000 + i * 10, on_battery: false, valid: true, battery_w: None, pkg_w: Some(pkg), brightness: b, lit });
+                est = ac.observe(Obs { at: at + 1000 + i * 10, on_battery: false, valid: true, battery_w: None, pkg_w: Some(pkg), brightness: b, lit, dgpu_awake: false });
             }
             let (w, _) = est.expect("estimate");
             let t = truth(pkg, b, &lit);
             assert!((w - t).abs() < 0.3, "{lit:?}: {w} vs {t}");
         }
-        let err = m.observe(Obs { at: at + 10, on_battery: true, valid: true, battery_w: Some(10.0), pkg_w: Some(4.0), brightness: 0.9, lit: [None, None] }).unwrap().1;
+        let err = m.observe(Obs { at: at + 10, on_battery: true, valid: true, battery_w: Some(10.0), pkg_w: Some(4.0), brightness: 0.9, lit: [None, None], dgpu_awake: false }).unwrap().1;
         assert!(err.unwrap() < 0.5, "noise-free data must give a small prequential error");
     }
 
@@ -479,7 +482,7 @@ mod tests {
         let states = [(4.0, 0.9, [Some(Some(0.3)), None]), (14.0, 0.5, [Some(Some(0.6)), None])];
         let at = run(&mut m, &states, 6);
         assert!(m.status().starts_with("panel 0"));
-        let est = m.observe(Obs { at: at + 10, on_battery: false, valid: true, battery_w: None, pkg_w: Some(5.0), brightness: 0.9, lit: [None, None] });
+        let est = m.observe(Obs { at: at + 10, on_battery: false, valid: true, battery_w: None, pkg_w: Some(5.0), brightness: 0.9, lit: [None, None], dgpu_awake: false });
         assert_eq!(est, None);
     }
 
@@ -490,9 +493,28 @@ mod tests {
         let mut at = 0;
         for _ in 0..200 {
             at += 10;
-            m.observe(Obs { at, on_battery: true, valid: false, battery_w: Some(9.0), pkg_w: Some(4.0), brightness: 0.9, lit: states[0].2 });
+            m.observe(Obs { at, on_battery: true, valid: false, battery_w: Some(9.0), pkg_w: Some(4.0), brightness: 0.9, lit: states[0].2, dgpu_awake: false });
         }
         assert_eq!(m.n, 0);
+    }
+
+    #[test]
+    fn an_awake_discrete_gpu_is_not_learned() {
+        // 30 W more than the chip explains, with the card awake (an external screen on the
+        // card's port): none of it may end up in the base or a screen term
+        let mut m = Model::default();
+        let mut at = 0;
+        for _ in 0..200 {
+            at += 10;
+            m.observe(Obs { at, on_battery: true, valid: true, battery_w: Some(39.0), pkg_w: Some(4.0), brightness: 0.9, lit: [None, None], dgpu_awake: true });
+        }
+        assert_eq!(m.n, 0);
+        // the card goes to sleep: a new stretch, learned after the settle time
+        for _ in 0..30 {
+            at += 10;
+            m.observe(Obs { at, on_battery: true, valid: true, battery_w: Some(9.0), pkg_w: Some(4.0), brightness: 0.9, lit: [None, None], dgpu_awake: false });
+        }
+        assert!(m.n > 0);
     }
 
     #[test]
@@ -500,10 +522,10 @@ mod tests {
         let mut m = Model::default();
         for i in 1..=14 {
             // 140 s: settle 90 + steady 60 not reached yet
-            m.observe(Obs { at: i * 10, on_battery: true, valid: true, battery_w: Some(9.0), pkg_w: Some(4.0), brightness: 0.9, lit: [None, None] });
+            m.observe(Obs { at: i * 10, on_battery: true, valid: true, battery_w: Some(9.0), pkg_w: Some(4.0), brightness: 0.9, lit: [None, None], dgpu_awake: false });
         }
         assert_eq!(m.n, 0);
-        m.observe(Obs { at: 160, on_battery: true, valid: true, battery_w: Some(9.0), pkg_w: Some(4.0), brightness: 0.9, lit: [None, None] });
+        m.observe(Obs { at: 160, on_battery: true, valid: true, battery_w: Some(9.0), pkg_w: Some(4.0), brightness: 0.9, lit: [None, None], dgpu_awake: false });
         assert_eq!(m.n, 1);
     }
 
@@ -551,7 +573,7 @@ mod tests {
         assert!(l.ready, "{l:?}");
         assert_eq!(l.panels.len(), 1, "only the real screen is shown: {l:?}");
         assert_eq!(m.status(), "ready");
-        let est = m.observe(Obs { at: at + 10, on_battery: false, valid: true, battery_w: None, pkg_w: Some(5.0), brightness: 0.9, lit: [Some(Some(0.4)), None] });
+        let est = m.observe(Obs { at: at + 10, on_battery: false, valid: true, battery_w: None, pkg_w: Some(5.0), brightness: 0.9, lit: [Some(Some(0.4)), None], dgpu_awake: false });
         assert!(est.is_some());
     }
 
