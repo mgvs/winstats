@@ -138,7 +138,9 @@ pub struct Link {
 }
 
 impl Link {
-    fn start(addr: String, token: String) -> Link {
+    /// `battery_since`: the newest battery history point the machine has, read again for the
+    /// hello of every (re)connect
+    fn start(addr: String, token: String, battery_since: Arc<std::sync::atomic::AtomicU64>) -> Link {
         let state = Arc::new(Mutex::new(LinkState { status: Status::Connecting, frames: VecDeque::new(), want_details: None, last_rx: None, gone: false }));
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -146,7 +148,8 @@ impl Link {
             let stop = stop.clone();
             let addr = addr.clone();
             let token = token.clone();
-            std::thread::Builder::new().name(format!("link {addr}")).spawn(move || link_thread(addr, token, state, stop)).ok();
+            let since = battery_since.clone();
+            std::thread::Builder::new().name(format!("link {addr}")).spawn(move || link_thread(addr, token, since, state, stop)).ok();
         }
         Link { state, stop, addr, token }
     }
@@ -158,11 +161,12 @@ impl Drop for Link {
     }
 }
 
-fn link_thread(addr: String, token: String, state: Arc<Mutex<LinkState>>, stop: Arc<AtomicBool>) {
+fn link_thread(addr: String, token: String, battery_since: Arc<std::sync::atomic::AtomicU64>, state: Arc<Mutex<LinkState>>, stop: Arc<AtomicBool>) {
     let mut backoff = 1u64;
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
-        let _ = session(&addr, &token, &state, &stop);
+        let since = battery_since.load(Ordering::Relaxed);
+        let _ = session(&addr, &token, since, &state, &stop);
         let mut s = state.lock().unwrap();
         s.status = Status::Offline;
         // a session that received data was a working link: the next drop retries quickly again
@@ -179,7 +183,7 @@ fn link_thread(addr: String, token: String, state: Arc<Mutex<LinkState>>, stop: 
     }
 }
 
-fn session(addr: &str, token: &str, state: &Arc<Mutex<LinkState>>, stop: &Arc<AtomicBool>) -> std::io::Result<()> {
+fn session(addr: &str, token: &str, battery_since: u64, state: &Arc<Mutex<LinkState>>, stop: &Arc<AtomicBool>) -> std::io::Result<()> {
     state.lock().unwrap().status = Status::Connecting;
     let sa = addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unresolvable"))?;
     let stream = TcpStream::connect_timeout(&sa, Duration::from_secs(4))?;
@@ -187,7 +191,7 @@ fn session(addr: &str, token: &str, state: &Arc<Mutex<LinkState>>, stop: &Arc<At
     stream.set_read_timeout(Some(Duration::from_secs(PING_INTERVAL_SECS * 4)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream.try_clone()?);
-    write_frame(&mut writer, &Frame::Hello { v: VERSION, client: format!("winstats {}", crate::about::VERSION), token: token.to_string() })?;
+    write_frame(&mut writer, &Frame::Hello { v: VERSION, client: format!("winstats {}", crate::about::VERSION), token: token.to_string(), battery_since: Some(battery_since) })?;
 
     // writer: pings, and details requests when the UI asks
     let done = Arc::new(AtomicBool::new(false));
@@ -264,6 +268,10 @@ pub struct Agent {
     pub stale: bool,
     /// unix seconds of the last battery history point
     hist_at: u64,
+    /// the agent keeps the battery history itself (0.3.3+): its points, not ours
+    agent_history: bool,
+    /// the newest point of the battery history, shared with the link for its hello
+    battery_since: Arc<std::sync::atomic::AtomicU64>,
     /// when the link went down, for the popup
     pub offline_since: Option<Instant>,
     net_disabled: Vec<String>,
@@ -297,6 +305,8 @@ impl Agent {
             offline_since: None,
             addr_since: Instant::now(),
             hist_at: 0,
+            agent_history: false,
+            battery_since: Default::default(),
             net_disabled: cfg.net_disabled.clone(),
             disks_disabled: cfg.disks_disabled.clone(),
             last_sample: None,
@@ -559,20 +569,51 @@ impl Agent {
         match s.battery.as_ref() {
             Some(b) => {
                 let tel = battery_telemetry(b, &s.power);
-                if tel.at_unix >= self.hist_at + metrics::power::HIST_STEP {
+                if let Some(p) = &s.battery_point {
+                    // the agent keeps the history: its point, on its grid
+                    self.agent_history = true;
+                    self.add_battery_points(std::slice::from_ref(p));
+                } else if !self.agent_history && tel.at_unix >= self.hist_at + metrics::power::HIST_STEP {
+                    // an older agent: the history is what came while connected
                     self.hist_at = tel.at_unix;
-                    let flow = metrics::powerflow::flow(&tel);
-                    let point = metrics::power::HistPoint { at: tel.at_unix, level: b.level, watts: flow.system.value().unwrap_or(f32::NAN), split: metrics::powerflow::split(&tel) };
-                    let h = std::sync::Arc::make_mut(&mut d.power_history);
-                    h.push(point);
-                    if h.len() > metrics::power::HIST_LEN {
-                        let extra = h.len() - metrics::power::HIST_LEN;
-                        h.drain(..extra);
-                    }
+                    let point = winstats_proto::BatteryPoint {
+                        at: tel.at_unix,
+                        level: b.level,
+                        on_ac: b.on_ac,
+                        batt_w: b.rate_w,
+                        sys_w: s.power.iter().find(|p| p.id == "System").map(|p| p.w),
+                        cpu_w: s.power.iter().find(|p| p.id == "CPU").map(|p| p.w),
+                    };
+                    self.add_battery_points(&[point]);
                 }
-                d.power_tel = Some(std::sync::Arc::new(tel));
+                self.data.power_tel = Some(std::sync::Arc::new(tel));
             }
-            None => d.power_tel = None,
+            None => self.data.power_tel = None,
+        }
+    }
+
+    /// The agent's battery history after what we have: from a new connection, all it kept.
+    fn apply_battery_history(&mut self, points: Vec<winstats_proto::BatteryPoint>) {
+        self.agent_history = true;
+        self.add_battery_points(&points);
+    }
+
+    /// Battery history points into the popup's history, oldest first, after what is there (a
+    /// point from before the newest one we have replaces nothing: it came twice).
+    fn add_battery_points(&mut self, points: &[winstats_proto::BatteryPoint]) {
+        let h = std::sync::Arc::make_mut(&mut self.data.power_history);
+        for p in points {
+            if h.last().map_or(false, |last| p.at <= last.at) {
+                continue;
+            }
+            h.push(hist_point(p));
+        }
+        if h.len() > metrics::power::HIST_LEN {
+            let extra = h.len() - metrics::power::HIST_LEN;
+            h.drain(..extra);
+        }
+        if let Some(last) = h.last() {
+            self.battery_since.store(last.at, Ordering::Relaxed);
         }
     }
 
@@ -761,7 +802,7 @@ impl Remotes {
             let want_link = rc.enabled && !rc.address.is_empty();
             match (&agent.link, want_link) {
                 (Some(l), true) if l.addr == rc.address && l.token == rc.token => {}
-                (_, true) => agent.link = Some(Link::start(rc.address.clone(), rc.token.clone())),
+                (_, true) => agent.link = Some(Link::start(rc.address.clone(), rc.token.clone(), agent.battery_since.clone())),
                 (Some(_), false) => agent.link = None,
                 (None, false) => {}
             }
@@ -793,6 +834,7 @@ impl Remotes {
                     }
                     Frame::Snapshot(s) => agent.apply_snapshot(s),
                     Frame::Details(d) => agent.apply_details(d),
+                    Frame::BatteryHistory { points } => agent.apply_battery_history(points),
                     _ => {}
                 }
             }
@@ -824,13 +866,30 @@ impl Remotes {
     }
 }
 
+/// A history point of the battery popup from an agent's: the charge, the battery's own power
+/// (signed, for the charge / discharge chart) and the machine's draw split as the live popup
+/// splits it.
+fn hist_point(p: &winstats_proto::BatteryPoint) -> metrics::power::HistPoint {
+    let b = winstats_proto::BatterySample { level: p.level, on_ac: p.on_ac, charging: p.batt_w.map_or(false, |w| w > 0.0), rate_w: p.batt_w, ..Default::default() };
+    let mut power = Vec::new();
+    if let Some(w) = p.sys_w {
+        power.push(winstats_proto::PowerSample { id: "System".into(), w });
+    }
+    if let Some(w) = p.cpu_w {
+        power.push(winstats_proto::PowerSample { id: "CPU".into(), w });
+    }
+    let tel = battery_telemetry(&b, &power);
+    let watts = p.batt_w.filter(|w| w.is_finite() && w.abs() <= 1000.0).unwrap_or(f32::NAN);
+    metrics::power::HistPoint { at: p.at, level: p.level, watts, split: metrics::powerflow::split(&tel) }
+}
+
 /// What an agent says about its battery, as the battery popup takes it: the pack, the charger,
 /// and the machine's draw ("System" on a Mac) as the platform meter, which lets the popup work
 /// out the adapter, battery and system flows; the CPU's own draw as the package meter.
 fn battery_telemetry(b: &winstats_proto::BatterySample, power: &[winstats_proto::PowerSample]) -> metrics::power::Telemetry {
     use metrics::power::{Cell, MeterChannel, MeterRole, SourceKind, Telemetry};
     let mwh = |wh: Option<f32>| wh.filter(|v| *v > 0.0).map(|v| (v * 1000.0) as u32);
-    let rate_mw = b.rate_w.map(|w| (w * 1000.0) as i32);
+    let rate_mw = b.rate_w.filter(|w| w.is_finite() && w.abs() <= 1000.0).map(|w| (w * 1000.0) as i32);
     let cell = Cell {
         capacity_mwh: mwh(b.remaining_wh),
         full_mwh: mwh(b.full_wh),
@@ -846,6 +905,8 @@ fn battery_telemetry(b: &winstats_proto::BatterySample, power: &[winstats_proto:
     };
     let meters = power
         .iter()
+        // a sensor glitch (a wrapped or garbled value) is not a reading
+        .filter(|p| p.w.is_finite() && (0.0..=1000.0).contains(&p.w))
         .filter_map(|p| {
             let role = match p.id.as_str() {
                 "System" => MeterRole::Platform,
@@ -924,6 +985,19 @@ pub fn key_for(name: &str, taken: &BTreeMap<String, RemoteCfg>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mac_battery_draw_is_the_system_power() {
+        // what a MacBook on its charger sends (agent 0.3.2): full, idle, 9 W system draw
+        let b = winstats_proto::BatterySample { level: 1.0, charging: false, on_ac: true, rate_w: Some(0.0), remaining_wh: Some(85.6), full_wh: Some(88.0), design_wh: Some(108.9), cycles: Some(614), voltage_mv: Some(12526), temp_c: Some(33.0), adapter_w: Some(140), adapter_ma: Some(4990), ..Default::default() };
+        let power = [winstats_proto::PowerSample { id: "System".into(), w: 9.0 }];
+        let tel = super::battery_telemetry(&b, &power);
+        let split = crate::metrics::powerflow::split(&tel);
+        eprintln!("flow {:?}  split {:?}", crate::metrics::powerflow::flow(&tel), split);
+        assert!((split.total - 9.0).abs() < 0.01, "total {}", split.total);
+        let stacked: f32 = split.parts.iter().filter(|v| v.is_finite()).sum();
+        assert!(stacked <= 9.01, "parts {:?}", split.parts);
+    }
+
     use super::*;
 
     #[test]

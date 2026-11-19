@@ -13,6 +13,7 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 mod net;
+mod history;
 mod service;
 #[cfg(not(windows))]
 mod unixcpu;
@@ -40,6 +41,8 @@ pub struct Shared {
     pub cfg: Config,
     /// writers of the connected masters, for the goodbye on exit
     pub clients: Mutex<Vec<Arc<Mutex<BufWriter<TcpStream>>>>>,
+    /// the battery's past week, for masters that ask (see `history`)
+    pub history: Mutex<history::BatteryHistory>,
 }
 
 fn usage() -> ! {
@@ -153,7 +156,7 @@ fn main() {
     let info = collector.info.clone();
     eprintln!("winstats-agent {AGENT_VERSION}: {} ({} {}), {} cores, port {}, multicast {}, config {}", info.name, info.os, info.arch, info.cores, cfg.port, if cfg.multicast { "on" } else { "off" }, path.display());
 
-    let shared = Arc::new(Shared { snap: Mutex::new(Snapshot::default()), changed: Condvar::new(), info: Mutex::new(info), collector: Mutex::new(collector), cfg: cfg.clone(), clients: Mutex::new(Vec::new()) });
+    let shared = Arc::new(Shared { snap: Mutex::new(Snapshot::default()), changed: Condvar::new(), info: Mutex::new(info), collector: Mutex::new(collector), cfg: cfg.clone(), clients: Mutex::new(Vec::new()), history: Mutex::new(history::BatteryHistory::load(path.parent().map(|d| d.join("battery_history.csv")))) });
     net::exit_with_goodbye(shared.clone());
 
     // sampler
@@ -163,10 +166,12 @@ fn main() {
             .name("sampler".into())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(shared.cfg.interval_ms));
-                let (snap, info) = {
+                let (mut snap, info) = {
                     let mut c = shared.collector.lock().unwrap();
                     (c.sample(), c.info.clone())
                 };
+                // a battery history point when one is due, sent along with this sample
+                snap.battery_point = shared.history.lock().unwrap().record(&snap);
                 {
                     let mut i = shared.info.lock().unwrap();
                     if *i != info {

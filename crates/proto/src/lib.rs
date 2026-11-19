@@ -305,6 +305,28 @@ pub struct BatterySample {
     pub adapter_ma: Option<u32>,
 }
 
+/// One point of an agent's battery history (every 30 s); short names keep a week of them small.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct BatteryPoint {
+    /// unix seconds
+    #[serde(rename = "a")]
+    pub at: u64,
+    /// 0..1
+    #[serde(rename = "l")]
+    pub level: f32,
+    #[serde(rename = "c", default)]
+    pub on_ac: bool,
+    /// battery power, W: positive while charging, negative while discharging
+    #[serde(rename = "b", default, skip_serializing_if = "Option::is_none")]
+    pub batt_w: Option<f32>,
+    /// the machine's measured draw ("System" on a Mac), W
+    #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+    pub sys_w: Option<f32>,
+    /// the CPU's own draw, W
+    #[serde(rename = "p", default, skip_serializing_if = "Option::is_none")]
+    pub cpu_w: Option<f32>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TempSample {
     pub id: String,
@@ -354,6 +376,9 @@ pub struct Snapshot {
     pub fans: Vec<FanSample>,
     #[serde(default)]
     pub power: Vec<PowerSample>,
+    /// a new battery history point (agent 0.3.3+): masters that keep the history add it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_point: Option<BatteryPoint>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -484,6 +509,11 @@ pub enum Frame {
         client: String,
         #[serde(default)]
         token: String,
+        /// a master that keeps battery history: the newest point it has (0: none). The agent
+        /// (0.3.3+) answers with `BatteryHistory` from there; older agents ignore it, and an
+        /// agent never sends that frame to a master that did not ask (it would not know it).
+        #[serde(default)]
+        battery_since: Option<u64>,
     },
     Info(Info),
     Snapshot(Snapshot),
@@ -491,6 +521,10 @@ pub enum Frame {
     Details(Details),
     Ping,
     Pong,
+    /// the agent's battery history after the master's `battery_since`, oldest first
+    BatteryHistory {
+        points: Vec<BatteryPoint>,
+    },
     /// the agent refuses the session (bad token, unsupported version) or is going away
     /// (`BYE_SHUTDOWN`)
     Bye {
@@ -543,7 +577,8 @@ mod tests {
     fn frame_roundtrip() {
         let mut buf = Vec::new();
         let frames = vec![
-            Frame::Hello { v: VERSION, client: "test".into(), token: String::new() },
+            Frame::Hello { v: VERSION, client: "test".into(), token: String::new(), battery_since: Some(0) },
+            Frame::BatteryHistory { points: vec![BatteryPoint { at: 1_800_000_000, level: 0.5, on_ac: true, batt_w: Some(-3.5), sys_w: None, cpu_w: Some(1.25) }] },
             Frame::Snapshot(Snapshot { seq: 7, cpu: CpuSample { total: 0.5, cores: vec![0.1, 0.9], ..Default::default() }, ..Default::default() }),
             Frame::Ping,
             Frame::Bye { reason: "no".into() },

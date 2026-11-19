@@ -151,6 +151,7 @@ fn snapshot_from(d: &MetricsData, seq: u64) -> Snapshot {
         load: Vec::new(),
         fans: Vec::new(),
         power: Vec::new(),
+        battery_point: None,
     }
 }
 
@@ -312,7 +313,7 @@ fn client(stream: TcpStream, inner: Arc<Inner>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let writer = Arc::new(Mutex::new(BufWriter::new(stream)));
     match read_frame(&mut reader)? {
-        Frame::Hello { v, client, token } => {
+        Frame::Hello { v, client, token, .. } => {
             if v != VERSION {
                 write_frame(&mut *writer.lock().unwrap(), &Frame::Bye { reason: format!("protocol {v}, this winstats speaks {VERSION}") })?;
                 return Ok(());

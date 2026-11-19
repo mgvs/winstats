@@ -183,8 +183,8 @@ fn client(stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
     let writer = Arc::new(Mutex::new(BufWriter::new(stream)));
 
     let hello = read_frame(&mut reader)?;
-    match hello {
-        Frame::Hello { v, client, token } => {
+    let battery_since = match hello {
+        Frame::Hello { v, client, token, battery_since } => {
             if v != VERSION {
                 write_frame(&mut *writer.lock().unwrap(), &Frame::Bye { reason: format!("protocol {v}, agent speaks {VERSION}") })?;
                 return Ok(());
@@ -194,14 +194,22 @@ fn client(stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
                 return Ok(());
             }
             eprintln!("{peer}: connected ({client})");
+            battery_since
         }
         _ => {
             write_frame(&mut *writer.lock().unwrap(), &Frame::Bye { reason: "hello expected".into() })?;
             return Ok(());
         }
-    }
+    };
     let info = shared.info.lock().unwrap().clone();
     write_frame(&mut *writer.lock().unwrap(), &Frame::Info(info.clone()))?;
+    // the battery history the master does not have yet, when it keeps one
+    if let Some(since) = battery_since {
+        let points = shared.history.lock().unwrap().since(since);
+        if !points.is_empty() {
+            write_frame(&mut *writer.lock().unwrap(), &Frame::BatteryHistory { points })?;
+        }
+    }
     shared.clients.lock().unwrap().push(writer.clone());
 
     // writer: every new sample goes out; stops when the reader has closed the socket
@@ -296,7 +304,7 @@ pub fn watch(host: &str, token: &str) {
     });
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = BufWriter::new(stream);
-    write_frame(&mut writer, &Frame::Hello { v: VERSION, client: format!("winstats-agent watch {}", crate::AGENT_VERSION), token: token.to_string() }).unwrap();
+    write_frame(&mut writer, &Frame::Hello { v: VERSION, client: format!("winstats-agent watch {}", crate::AGENT_VERSION), token: token.to_string(), battery_since: None }).unwrap();
     let mut last_ping = Instant::now();
     let mut asked = false;
     loop {

@@ -568,7 +568,7 @@ impl Collector {
         let (gpu, battery, fans, power) = (mac.gpu, mac.battery, mac.fans, mac.power);
         #[cfg(not(target_os = "macos"))]
         let (gpu, battery, fans, power) = (self.gpu.as_mut().map(|g| g.sample()), crate::linux::power::read_battery(&self.root), self.fans.sample(), self.rails.sample());
-        Snapshot { seq: self.seq, cpu, mem, net, disk, gpu, battery, temp, load, fans, power }
+        Snapshot { seq: self.seq, cpu, mem, net, disk, gpu, battery, temp, load, fans, power, battery_point: None }
     }
 
     /// Popup material: top processes and mounted volumes. The process table is refreshed at
