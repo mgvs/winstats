@@ -114,6 +114,23 @@ mod tests {
     use super::super::power::{Cell, MeterChannel, MeterRole};
     use super::*;
 
+    #[test]
+    fn a_draw_no_laptop_can_have_is_no_reading() {
+        // on AC without a platform meter the total is the model's estimate: a runaway one is
+        // left out rather than charted
+        let mut t = tel(Some(true), Some(0), None);
+        t.estimate = Some((12_760.0, None));
+        assert!(split(&t).total.is_nan());
+        t.estimate = Some((25.0, None));
+        assert_eq!(split(&t).total, 25.0);
+        // a measured platform draw above the charger's rating is a glitch too
+        let mut t = tel(Some(true), Some(0), Some(400.0));
+        t.source_w = Some(140);
+        assert!(split(&t).total.is_nan());
+        t.meters[0].watts = 30.0;
+        assert_eq!(split(&t).total, 30.0);
+    }
+
     fn tel(on_ac: Option<bool>, rate_mw: Option<i32>, platform: Option<f32>) -> Telemetry {
         let meters = platform.map(|w| vec![MeterChannel { name: "RAPL_Package0_PSYS".into(), watts: w, role: MeterRole::Platform }]).unwrap_or_default();
         Telemetry {
@@ -196,6 +213,16 @@ impl Split {
     pub const NONE: Split = Split { total: f32::NAN, parts: [f32::NAN; 6] };
 }
 
+/// The most a battery machine can draw, W: a little over its charger's rating where it reports
+/// one, else what the largest laptop chargers give. A measured or estimated draw above it is a
+/// glitch or a model gone astray, not a reading: it is left out of the split and the history.
+pub fn ceiling(t: &Telemetry) -> f32 {
+    match t.source_w.filter(|w| *w >= 5) {
+        Some(w) => w as f32 * 1.25,
+        None => 330.0,
+    }
+}
+
 pub fn split(t: &Telemetry) -> Split {
     use super::power::MeterRole;
     let meters = if t.meters_avg.is_empty() { &t.meters } else { &t.meters_avg };
@@ -222,7 +249,7 @@ pub fn split(t: &Telemetry) -> Split {
         Some(v) => Some(v),
         None => (t.on_ac == Some(true)).then_some(t.estimate).flatten().map(|e| e.0).filter(|w| *w >= chip.unwrap_or(0.0)),
     };
-    let Some(total) = total.filter(|v| v.is_finite() && *v >= 0.0) else {
+    let Some(total) = total.filter(|v| v.is_finite() && *v >= 0.0 && *v <= ceiling(t)) else {
         return Split { total: f32::NAN, parts };
     };
     let rest = (total - chip.unwrap_or(0.0)).max(0.0);

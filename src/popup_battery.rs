@@ -189,7 +189,7 @@ pub(super) fn chart_page(ui: &mut Ui, m: &MetricsData, chart_h: f32) {
     // charge 25 %, battery power 35 %, consumption 40 %
     let h = chart_h.max(240.0);
     history(ui, &m.power_history, now, true, full_wh, (h * 0.25, h * 0.35));
-    draw_history(ui, &m.power_history, now, true, h * 0.40);
+    draw_history(ui, &m.power_history, now, true, h * 0.40, draw_ceiling(m.power_tel.as_deref()));
 }
 
 pub fn draw(ui: &mut Ui, m: &MetricsData) {
@@ -251,7 +251,7 @@ pub fn draw(ui: &mut Ui, m: &MetricsData) {
             link(ui, &t("power.open_settings"), "ms-settings:powersleep");
         }
         if local || !m.power_history.is_empty() {
-            draw_history(ui, &m.power_history, tel.at_unix, false, 136.0);
+            draw_history(ui, &m.power_history, tel.at_unix, false, 136.0, draw_ceiling(Some(tel)));
         }
     });
     ui.y = top + h1.max(h2);
@@ -1515,10 +1515,17 @@ pub(super) fn history(ui: &mut Ui, points: &[HistPoint], now: u64, big: bool, fu
     }
 }
 
+/// The most a battery machine can draw, W: a little over its charger's rating where it reports
+/// one, else what the largest laptop chargers give. A reading above it (a sensor glitch) neither
+/// stretches the draw chart's scale nor leaves the chart.
+fn draw_ceiling(tel: Option<&Telemetry>) -> f32 {
+    tel.map_or(330.0, powerflow::ceiling)
+}
+
 /// The machine's draw over time, stacked by consumer: the chip parts (measured), screens and
 /// conversion (learned) and the remainder of the total. Where the total is unknown (on AC before
-/// the model has learned) only the metered chip parts are stacked.
-pub(super) fn draw_history(ui: &mut Ui, points: &[HistPoint], now: u64, big: bool, height: f32) {
+/// the model has learned) only the metered chip parts are stacked. `ceiling`: see `draw_ceiling`.
+pub(super) fn draw_history(ui: &mut Ui, points: &[HistPoint], now: u64, big: bool, height: f32, ceiling: f32) {
     let now = if now == 0 { points.last().map_or(0, |p| p.at) } else { now };
     let hours = match ui.t.battery_hours {
         h @ (1 | 6 | 24) => h,
@@ -1533,8 +1540,11 @@ pub(super) fn draw_history(ui: &mut Ui, points: &[HistPoint], now: u64, big: boo
     ui.y += th + ui.t.s(6.0);
     let ticks = time_ticks(now, window);
     let (x, y, w, h) = ui.chart_box(height);
-    let series: Vec<Vec<Option<f32>>> = (0..6).map(|k| columns(points, now, window, w, move |p| p.split.parts[k])).collect();
-    let total = columns(points, now, window, w, |p| p.split.total);
+    // a point drawing more than the machine can (a glitch, or one saved before the ceiling) is
+    // left out altogether rather than drawn
+    let sane = move |p: &HistPoint| p.split.total.is_nan() || p.split.total <= ceiling;
+    let series: Vec<Vec<Option<f32>>> = (0..6).map(|k| columns(points, now, window, w, move |p| if sane(p) && p.split.parts[k] <= ceiling { p.split.parts[k] } else { f32::NAN })).collect();
+    let total = columns(points, now, window, w, move |p| if sane(p) { p.split.total } else { f32::NAN });
     // per column: the stacked sum (the total where known, else what is metered)
     let stack: Vec<Option<f32>> = (0..w as usize)
         .map(|i| {
@@ -1543,6 +1553,7 @@ pub(super) fn draw_history(ui: &mut Ui, points: &[HistPoint], now: u64, big: boo
             total[i].map(|t| t.max(s)).or(any.then_some(s))
         })
         .collect();
+    // the scale follows the highest plausible reading; a glitch above the ceiling stays at the top
     let peak = stack.iter().flatten().fold(0.0f32, |m, v| m.max(*v));
     let scale = ((peak / 5.0).ceil() * 5.0).max(5.0);
     ui.c.fill_rect(x + 1, y + h / 2, w - 2, 1, ui.t.dim.alpha(0.15));
@@ -1556,7 +1567,8 @@ pub(super) fn draw_history(ui: &mut Ui, points: &[HistPoint], now: u64, big: boo
         let mut cum = 0.0f32;
         for (k, s) in series.iter().enumerate() {
             let Some(v) = s[i].filter(|v| *v > 0.0) else { continue };
-            let (lo, hi) = ((bottom - cum * px).round() as i32, (bottom - (cum + v) * px).round() as i32);
+            let top_px = (y + 1) as f32;
+            let (lo, hi) = ((bottom - cum * px).max(top_px).round() as i32, (bottom - (cum + v) * px).max(top_px).round() as i32);
             if lo > hi {
                 ui.c.fill_rect(x + i as i32, hi, 1, lo - hi, cols[k].alpha(0.55));
                 ui.c.fill_rect(x + i as i32, hi, 1, 1, cols[k]);
@@ -1835,6 +1847,44 @@ mod tests {
             std::fs::create_dir_all(&out).unwrap();
             c.save_bmp(&out.join(format!("charts_{hours}h.bmp")), Color::rgb(0x20, 0x20, 0x20)).unwrap();
         }
+    }
+
+    /// `cargo test remote_mac_preview -- --ignored`: a Mac's battery popup from its agent's data
+    /// (9-30 W system draw, on the charger), in target/previews/remote_mac.bmp.
+    #[test]
+    #[ignore]
+    fn remote_mac_preview() {
+        use crate::widgets::{ColorMode, Theme};
+        use std::sync::Arc;
+        crate::i18n::set_language("ru");
+        let now = 1_800_000_000u64;
+        let hist: Vec<HistPoint> = [30.0f32, 24.4, 19.0, 17.5, 22.0, 26.0, 18.0]
+            .iter()
+            .enumerate()
+            .map(|(i, w)| HistPoint { at: now - (7 - i as u64) * HIST_STEP, level: 1.0, watts: *w, split: crate::metrics::powerflow::Split { total: *w, parts: [f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN, *w] } })
+            .collect();
+        let cell = crate::metrics::power::Cell { capacity_mwh: Some(85_600), full_mwh: Some(88_000), design_mwh: Some(108_900), voltage_mv: Some(12_526), rate_mw: Some(0), cycles: Some(614), temp_c: Some(33.0), on_line: true, ..Default::default() };
+        let meters = vec![crate::metrics::power::MeterChannel { name: "System".into(), watts: 18.0, role: MeterRole::Platform }];
+        let tel = Telemetry { at_unix: now, cells: vec![cell], level: Some(1.0), on_ac: Some(true), source: Some((SourceKind::Ac, Some(4990))), source_w: Some(140), meters, ..Default::default() };
+        let theme = Theme {
+            text: Color::rgb(255, 255, 255), dim: Color::rgba(255, 255, 255, 150), accent: Color::rgb(0x60, 0xCD, 0xFF), outline: None, light: false, scale: 1.0, inner_h: 20, labels: true, font_scale: 1.0, split_pe: true, chart_w: 34.0, bar_w: 3.0,
+            modes: [ColorMode::Accent; crate::widgets::MODULE_COUNT], label: None, net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: false, battery_hours: 6, style: crate::style::Style::Windows, battery_view: Default::default(),
+        };
+        let m = MetricsData { host: "mac".into(), power_tel: Some(Arc::new(tel)), power_history: Arc::new(hist), battery: Some(crate::metrics::battery::Battery { level: 1.0, charging: false, on_ac: true, remaining_secs: None }), ..Default::default() };
+        let (w, h) = (560, 900);
+        let mut c = Canvas::new();
+        c.resize(w, h);
+        c.clear();
+        let mut icons = crate::procicon::IconCache::default();
+        let (mut locks, mut frozen) = (Vec::new(), None);
+        let expanded = std::collections::HashSet::new();
+        let flipped = std::collections::HashSet::new();
+        let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: None, copied: None, anim: None, anim_bg: Vec::new(), phase: 0.0, max_rows: None, flipped: &flipped, fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
+        draw(&mut ui, &m);
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("previews");
+        std::fs::create_dir_all(&out).unwrap();
+        c.save_bmp(&out.join("remote_mac.bmp"), Color::rgb(0x20, 0x20, 0x20)).unwrap();
+        crate::i18n::set_language("en");
     }
 
     #[test]
