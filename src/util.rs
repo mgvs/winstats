@@ -379,6 +379,32 @@ pub fn system_accent_color() -> Option<crate::canvas::Color> {
     Some(crate::canvas::Color::rgb((argb >> 16) as u8, (argb >> 8) as u8, argb as u8))
 }
 
+/// The clipboard's text, if it holds any (pasting into a popup text field).
+pub fn get_clipboard() -> Option<String> {
+    use windows::Win32::Foundation::{HGLOBAL, HWND};
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        OpenClipboard(HWND::default()).ok()?;
+        let mut out = None;
+        if let Ok(h) = GetClipboardData(CF_UNICODETEXT) {
+            let g = HGLOBAL(h.0);
+            let p = GlobalLock(g) as *const u16;
+            if !p.is_null() {
+                let mut n = 0;
+                while n < 4096 && *p.add(n) != 0 {
+                    n += 1;
+                }
+                out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));
+                let _ = GlobalUnlock(g);
+            }
+        }
+        let _ = CloseClipboard();
+        out
+    }
+}
+
 /// Put `text` on the clipboard as Unicode text.
 pub fn set_clipboard(text: &str) -> bool {
     use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};

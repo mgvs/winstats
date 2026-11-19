@@ -1,7 +1,7 @@
 //! Click popup: a top-level layered window anchored to the clicked widget
 //! showing details for that module. Content is drawn with the same Canvas as the strip.
 
-use crate::canvas::{Canvas, Color, FW_NORMAL, FW_SEMIBOLD, FontSpec, RED, YELLOW};
+use crate::canvas::{Canvas, Color, FW_NORMAL, FW_SEMIBOLD, FontSpec, GREEN, ORANGE, RED, YELLOW};
 use crate::metrics::MetricsData;
 use std::collections::VecDeque;
 use crate::util::{format_bytes, format_bytes_rate, format_net_rate, pcwstr, unit, wide};
@@ -48,6 +48,10 @@ const COPY_FLASH_SECS: f32 = 0.8;
 /// frames of a held chart catching up after the mouse left it
 pub const CHART_TIMER: usize = 8;
 const CATCH_UP_SECS: f32 = 0.5;
+/// timer id of the caret blink while a text field is being edited
+pub const EDIT_TIMER: usize = 9;
+/// caret blink half-period
+const CARET_MS: u128 = 530;
 
 /// The history charts as they were when the mouse came onto one: they stand still under the
 /// mouse (the rows keep updating), and when it leaves they scroll the skipped samples in.
@@ -146,6 +150,14 @@ pub enum Action {
     ScreenOff(bool, u32),
     /// a chart that shows a cursor at the mouse: redrawn on every mouse move over it
     Track,
+    /// open a text field in the network popup: 0 / 1 = ping targets, 2 = custom DNS servers
+    EditPingHost(u8),
+    /// focus field n of the open edit (two-field DNS editor)
+    EditFocus(u8),
+    /// switch DNS: -1 = automatic, 0.. = metrics::dns::PRESETS
+    Dns(i8),
+    /// apply the saved custom DNS servers (opens the editor when there are none)
+    DnsCustom,
 }
 
 /// A clickable row rectangle, in content coords.
@@ -385,6 +397,62 @@ pub struct Popup {
     render_stats: (u32, f64),
     /// window position of the last render (layered windows are presented there)
     win_pos: (i32, i32),
+    /// the ping target or DNS servers being edited in place (network popup)
+    pub edit: Option<PingEdit>,
+}
+
+/// A text edit open in the network popup: one field for a ping target, two (preferred and
+/// alternate server) for custom DNS.
+pub struct PingEdit {
+    /// what is edited: 0 / 1 = ping targets, 2 = custom DNS servers
+    pub slot: u8,
+    pub fields: Vec<crate::textfield::TextField>,
+    /// the field with the keyboard
+    pub focus: usize,
+    /// the last Enter was refused: shown in red until the next key
+    pub error: bool,
+    /// last key: the caret shows steadily for a moment after typing
+    pub since: Instant,
+}
+
+impl PingEdit {
+    /// the field with the keyboard
+    pub fn field(&mut self) -> &mut crate::textfield::TextField {
+        &mut self.fields[self.focus]
+    }
+
+    /// the fields' texts, trimmed, empty ones left out
+    pub fn texts(&self) -> Vec<String> {
+        self.fields.iter().map(|f| f.text.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    }
+
+    /// Move the keyboard to field `i`.
+    pub fn focus_on(&mut self, i: usize) {
+        if i < self.fields.len() && i != self.focus {
+            self.fields[self.focus].all = false;
+            self.focus = i;
+            let f = &mut self.fields[i];
+            f.caret = f.text.chars().count();
+        }
+    }
+}
+
+/// What the drawing code needs of one field.
+#[derive(Clone)]
+struct FieldView {
+    text: String,
+    before: String,
+    all: bool,
+}
+
+/// What the drawing code needs of the open edit.
+#[derive(Clone)]
+struct EditView {
+    slot: u8,
+    fields: Vec<FieldView>,
+    focus: usize,
+    error: bool,
+    caret_on: bool,
 }
 
 
@@ -495,6 +563,7 @@ impl Popup {
             anim_stats: (0, 0.0, 0.0, Instant::now()),
             render_stats: (0, 0.0),
             win_pos: (0, 0),
+            edit: None,
         })
     }
 
@@ -699,6 +768,7 @@ impl Popup {
             self.visible = false;
             self.hidden_at = Some(Instant::now());
             self.stop_anim();
+            self.end_edit();
             self.press = None;
             self.end_hold();
         }
@@ -933,6 +1003,14 @@ impl Popup {
             let work = mi.rcWork.bottom - mi.rcWork.top;
             if work > 0 { work - t.s(8.0) * 2 - pad * 2 } else { i32::MAX }
         };
+        let ping_edit = self.edit.as_ref().map(|e| EditView {
+            slot: e.slot,
+            fields: e.fields.iter().map(|f| FieldView { text: f.text.clone(), before: f.before_caret().to_string(), all: f.all }).collect(),
+            focus: e.focus,
+            error: e.error,
+            // steady right after a key, then blinking
+            caret_on: (e.since.elapsed().as_millis() / CARET_MS) % 2 == 0,
+        });
         let mut canvas_h = t.s(900.0);
         let mut max_rows: Option<usize> = None;
         let mut attempt = 0;
@@ -940,7 +1018,7 @@ impl Popup {
             attempt += 1;
             self.content.resize(w - pad * 2, canvas_h);
             self.content.clear();
-            let mut ui = Ui { c: &mut self.content, t, w: w - pad * 2, y: 0, hover: self.hover, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut self.icons, indent: 0, locks: &mut self.locks, frozen: &mut self.frozen, expanded: &self.expanded, proc_filter: self.proc_filter, mem_bar: self.mem_bar, gpu_by_vram: self.gpu_by_vram, mouse: self.mouse, copied: copied.clone(), anim: None, anim_bg: Vec::new(), phase, max_rows, flipped: &self.rows_flipped, fold_open: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (m.sample_age(1, 0), if m.sample_ms > 0.0 { m.sample_ms / 1000.0 } else { 1.0 }), fold: Vec::new(), order: &self.row_order, drag: self.press.as_ref().filter(|p| p.dragging).map(|p| (p.key.clone(), p.cy)), frows: Vec::new() };
+            let mut ui = Ui { c: &mut self.content, t, w: w - pad * 2, y: 0, hover: self.hover, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut self.icons, indent: 0, locks: &mut self.locks, frozen: &mut self.frozen, expanded: &self.expanded, proc_filter: self.proc_filter, mem_bar: self.mem_bar, gpu_by_vram: self.gpu_by_vram, mouse: self.mouse, copied: copied.clone(), anim: None, anim_bg: Vec::new(), phase, max_rows, ping_edit: ping_edit.clone(), flipped: &self.rows_flipped, fold_open: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (m.sample_age(1, 0), if m.sample_ms > 0.0 { m.sample_ms / 1000.0 } else { 1.0 }), fold: Vec::new(), order: &self.row_order, drag: self.press.as_ref().filter(|p| p.dragging).map(|p| (p.key.clone(), p.cy)), frows: Vec::new() };
             match kind {
                 Kind::Cpu => draw_cpu(&mut ui, m),
                 Kind::Mem => draw_mem(&mut ui, m),
@@ -1123,6 +1201,41 @@ impl Popup {
         }
     }
 
+    /// Turn a block into text fields holding `texts` (the first one focused, all selected).
+    pub fn start_edit(&mut self, slot: u8, texts: &[String], max_len: usize) {
+        let fields = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let mut f = crate::textfield::TextField::new(t, max_len);
+                f.all = i == 0 && f.all;
+                f
+            })
+            .collect();
+        self.edit = Some(PingEdit { slot, fields, focus: 0, error: false, since: Instant::now() });
+        self.relayout();
+        unsafe {
+            SetTimer(self.hwnd, EDIT_TIMER, CARET_MS as u32, None);
+        }
+    }
+
+    pub fn end_edit(&mut self) {
+        if self.edit.take().is_some() {
+            self.relayout();
+            unsafe {
+                let _ = KillTimer(self.hwnd, EDIT_TIMER);
+            }
+        }
+    }
+
+    /// Note a key on the field: the caret shows, a refusal is forgotten.
+    pub fn edit_touched(&mut self) {
+        if let Some(e) = self.edit.as_mut() {
+            e.since = Instant::now();
+            e.error = false;
+        }
+    }
+
     /// The bands can be drawn straight into the window: no tooltip over them, fully in view.
     fn anim_in_view(&self, a: &battery_view::FlowAnim) -> bool {
         self.tip.is_none() && (self.max_scroll == 0 || (a.y >= self.scroll && a.y + a.h <= self.scroll + self.view_h))
@@ -1217,6 +1330,8 @@ struct Ui<'a> {
     phase: f32,
     /// process rows that fit on the screen; None = as configured
     max_rows: Option<usize>,
+    /// the ping target or DNS field, while it is being edited
+    ping_edit: Option<EditView>,
     /// rows of the "More" folds moved from their default place
     flipped: &'a std::collections::HashSet<String>,
     /// the "More" fold of the popup being drawn is open: every `frow` shows, a click on a label
@@ -2576,12 +2691,12 @@ fn draw_net(ui: &mut Ui, m: &MetricsData) {
     let start = ui.y;
     ui.row_lv(&up, &rate(m.net_tx), ui.on_off(ui.t.dim, show_tx), ui.on_off(UP, show_tx));
     ui.clickable(start, Action::ToggleNetSeries(false));
-    if !m.net_ping_host.is_empty() {
-        // ICMP probe to the configured host while the popup is open
-        let ms = |v: Option<f32>| v.map(|v| format!("{v:.1} {}", unit("ms"))).unwrap_or_else(|| t("popup.na"));
-        ui.section(&tf("popup.ping", &[("host", &m.net_ping_host)]));
-        ui.row(&t("popup.latency"), &ms(m.net_latency));
-        ui.row(&t("popup.jitter"), &ms(m.net_jitter));
+    // remote machines send no ping readings and have no DNS to change from here
+    let local = m.host.is_empty();
+    ping_block(ui, 0, &m.net_ping_host, m.net_latency, m.net_jitter, local);
+    ping_block(ui, 1, &m.net_ping_host2, m.net_latency2, m.net_jitter2, local);
+    if local {
+        dns_block(ui, m);
     }
     ui.section(&t("popup.since_start"));
     ui.row(&t("popup.received"), &format_bytes(m.net_total_rx));
@@ -2617,6 +2732,267 @@ fn draw_net(ui: &mut Ui, m: &MetricsData) {
             ui.clickable(start, Action::ToggleNet(i.alias.clone()));
         }
     }
+}
+
+/// One ping target (slot 0 or 1) while the popup is open: its readings, a clickable block that
+/// turns into a text field, or, without a target, the way to set one.
+fn ping_block(ui: &mut Ui, slot: u8, host: &str, latency: Option<f32>, jitter: Option<f32>, local: bool) {
+    if let Some(e) = ui.ping_edit.clone().filter(|e| local && e.slot == slot) {
+        ping_field(ui, &e);
+        return;
+    }
+    if !host.is_empty() {
+        // ICMP probe to the target while the popup is open
+        let ms = |v: Option<f32>| v.map(|v| format!("{v:.1} {}", unit("ms"))).unwrap_or_else(|| t("popup.na"));
+        let start = ui.y;
+        ui.section(&tf("popup.ping", &[("host", host)]));
+        ui.row(&t("popup.latency"), &ms(latency));
+        ui.row(&t("popup.jitter"), &ms(jitter));
+        if local {
+            // the whole block becomes a text field on a click
+            ui.clickable(start, Action::EditPingHost(slot));
+            ui.hover_tip(start, t("power.ping_tip"));
+        }
+    } else if local && slot == 0 {
+        // ping switched off: the block stays, so it can be switched on again from here
+        let start = ui.y;
+        ui.section(&t("power.ping_off_title"));
+        ui.row_lv(&t("power.ping_off"), "", ui.t.dim, ui.t.dim);
+        ui.clickable(start, Action::EditPingHost(slot));
+        ui.hover_tip(start, t("power.ping_tip"));
+    } else if local {
+        // no second target: one quiet line to add it
+        ui.space(4.0);
+        let start = ui.y;
+        let f = ui.font(10.0, FW_NORMAL);
+        let (_, h) = ui.c.draw_text(&t("power.ping_add"), 0, ui.y, f, ui.t.accent);
+        ui.y += h + ui.t.s(2.0);
+        ui.clickable(start, Action::EditPingHost(slot));
+    }
+}
+
+/// "1.1.1.1 · 1.0.0.1 (+2 IPv6)": the IPv4 servers, the IPv6 ones counted.
+fn dns_servers_text(servers: &[std::net::IpAddr]) -> String {
+    let v4: Vec<String> = servers.iter().filter(|s| s.is_ipv4()).map(|s| s.to_string()).collect();
+    let v6 = servers.iter().filter(|s| s.is_ipv6()).count();
+    let mut out = if v4.is_empty() { servers.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" \u{00B7} ") } else { v4.join(" \u{00B7} ") };
+    if !v4.is_empty() && v6 > 0 {
+        out.push_str(&format!(" (+{v6} IPv6)"));
+    }
+    out
+}
+
+/// The response time of `ip` as a short label: measured ms (green for the fastest), "…" while
+/// it is still to come, "–" without an answer. None when it is not measured.
+fn dns_speed(m: &MetricsData, ip: Option<std::net::IpAddr>, dim: Color) -> Option<(String, Color)> {
+    let ip = ip?;
+    let fastest = m.dns_speed.iter().filter_map(|(_, ms)| *ms).fold(f32::INFINITY, f32::min);
+    match m.dns_speed.iter().find(|(s, _)| *s == ip) {
+        Some((_, Some(ms))) => {
+            let text = if *ms < 10.0 { format!("{ms:.1} {}", unit("ms")) } else { format!("{ms:.0} {}", unit("ms")) };
+            let done = !m.dns_speed_running && m.dns_intercepted != Some(true);
+            Some((text, if done && *ms <= fastest { GREEN } else { dim }))
+        }
+        Some((_, None)) => Some(("\u{2013}".into(), dim)),
+        None if m.dns_speed_running => Some(("\u{2026}".into(), dim)),
+        None => None,
+    }
+}
+
+/// One choice of the DNS list: a radio dot, the name, the response time, the servers dimmed on
+/// the right.
+fn dns_choice(ui: &mut Ui, chosen: bool, name: &str, detail: &str, speed: Option<(String, Color)>, action: Action) {
+    let f = ui.font(11.0, FW_NORMAL);
+    let fd = ui.font(9.5, FW_NORMAL);
+    let start = ui.y;
+    let h = ui.c.measure_text("Xg", f).1;
+    let r = ui.t.s(5.0) as f32;
+    let cy = ui.y as f32 + h as f32 / 2.0;
+    let cx = r + ui.t.s(1.0) as f32;
+    if chosen {
+        ui.c.fill_circle(cx, cy, r, ui.t.accent);
+        ui.c.fill_circle(cx, cy, r * 0.4, if ui.t.light { Color::rgb(255, 255, 255) } else { Color::rgb(0x20, 0x20, 0x20) });
+    } else {
+        ui.c.fill_circle(cx, cy, r, ui.t.dim.alpha(0.55));
+        ui.c.fill_circle(cx, cy, r - ui.t.s(1.2) as f32, if ui.t.light { Color::rgb(0xF6, 0xF6, 0xF6) } else { Color::rgb(0x26, 0x26, 0x26) });
+    }
+    let x = ui.t.s(18.0);
+    // the response time sits in a fixed column after the names; the servers take what is left
+    let nw = ui.c.measure_text(name, f).0;
+    let sx = x + ui.t.s(78.0).max(nw + ui.t.s(8.0));
+    let sw = ui.t.s(44.0);
+    let (dw, dh) = ui.c.measure_text(detail, fd);
+    let dw = dw.min(ui.w - sx - sw - ui.t.s(6.0)).max(0);
+    ui.clipped(name, x, ui.y, sx - x - ui.t.s(4.0), f, if chosen { ui.t.text } else { ui.t.text.alpha(0.85) });
+    if let Some((s, col)) = speed {
+        let fs = ui.font(9.5, if col == GREEN { FW_SEMIBOLD } else { FW_NORMAL });
+        let ssh = ui.c.measure_text(&s, fs).1;
+        ui.c.draw_text(&s, sx, ui.y + (h - ssh) / 2, fs, col);
+    }
+    ui.clipped(detail, ui.w - dw, ui.y + (h - dh) / 2, dw, fd, ui.t.dim);
+    ui.y += h + ui.t.s(5.0);
+    ui.clickable(start, action);
+}
+
+/// DNS of the active interface: what is set now; a click opens the list (Automatic, the
+/// presets, Custom). A change runs elevated (one UAC prompt).
+fn dns_block(ui: &mut Ui, m: &MetricsData) {
+    use crate::metrics::dns::{Choice, PRESETS};
+    let Some(d) = m.dns.as_ref() else { return };
+    if let Some(e) = ui.ping_edit.clone().filter(|e| e.slot == 2) {
+        ping_field(ui, &e);
+        return;
+    }
+    let choice = d.choice();
+    let name = match choice {
+        Choice::Automatic => t("power.dns_auto"),
+        Choice::Preset(i) => PRESETS[i].name.to_string(),
+        Choice::Custom => t("power.dns_custom"),
+    };
+    let open = ui.expanded.contains("dns");
+    let start = ui.y;
+    ui.section(&tf("power.dns_title", &[("iface", &d.alias)]));
+    ui.row(&name, &dns_servers_text(&d.servers));
+    if m.dns_busy {
+        let f = ui.font(9.5, FW_NORMAL);
+        let (_, h) = ui.c.draw_text_clipped(&t("power.dns_busy"), 0, ui.y, ui.w, f, ui.t.accent);
+        ui.y += h + ui.t.s(3.0);
+    }
+    let caught = m.dns_intercepted == Some(true);
+    let warn = if ui.t.light { ORANGE } else { YELLOW };
+    if caught {
+        let f = ui.font(9.5, FW_NORMAL);
+        let (_, h) = ui.c.draw_text_clipped(&format!("\u{26A0} {}", t("power.dns_intercepted")), 0, ui.y, ui.w, f, warn);
+        ui.y += h + ui.t.s(3.0);
+    }
+    toggle_link(ui, "dns", open, &t("power.dns_change"), &t("power.dns_close"));
+    ui.clickable(start, Action::Expand("dns".into()));
+    if !open {
+        ui.hover_tip(start, t("power.dns_tip"));
+        return;
+    }
+    ui.space(3.0);
+    let dim = ui.t.dim;
+    // the automatic servers are only known while they are the ones in use
+    let auto_ip = if choice == Choice::Automatic { d.servers.first().cloned() } else { None };
+    dns_choice(ui, choice == Choice::Automatic, &t("power.dns_auto"), &t("power.dns_auto_detail"), dns_speed(m, auto_ip, dim), Action::Dns(-1));
+    for (i, p) in PRESETS.iter().enumerate() {
+        let detail = p.servers.iter().filter(|s| !s.contains(':')).cloned().collect::<Vec<_>>().join(" \u{00B7} ");
+        let ip = p.servers.first().and_then(|s| s.parse().ok());
+        dns_choice(ui, choice == Choice::Preset(i), p.name, &detail, dns_speed(m, ip, dim), Action::Dns(i as i8));
+    }
+    // Custom applies the saved servers like a preset; without any it opens the editor
+    if m.dns_custom.is_empty() {
+        dns_choice(ui, choice == Choice::Custom, &t("power.dns_custom"), &t("power.dns_custom_set"), None, Action::EditPingHost(2));
+    } else {
+        let ip = crate::metrics::dns::parse_servers(&m.dns_custom).and_then(|l| l.first().cloned());
+        dns_choice(ui, choice == Choice::Custom, &t("power.dns_custom"), &m.dns_custom.replace(", ", " \u{00B7} "), dns_speed(m, ip, dim), Action::DnsCustom);
+        let f = ui.font(9.5, FW_NORMAL);
+        let start = ui.y;
+        let x = ui.t.s(18.0);
+        let (_, h) = ui.c.draw_text(&t("power.dns_edit"), x, ui.y, f, ui.t.accent);
+        ui.y += h + ui.t.s(4.0);
+        ui.clickable(start, Action::EditPingHost(2));
+    }
+    let f = ui.font(9.0, FW_NORMAL);
+    let col = ui.t.dim.alpha(0.8);
+    if caught {
+        battery_view::wrap(ui, &t("power.dns_intercepted_note"), f, warn);
+        ui.y += ui.t.s(2.0);
+    }
+    battery_view::wrap(ui, &t("power.dns_speed_note"), f, col);
+    ui.y += ui.t.s(2.0);
+    battery_view::wrap(ui, &t("power.dns_uac_note"), f, col);
+}
+
+/// A right-aligned accent link with a chevron that opens / closes the block `key`.
+fn toggle_link(ui: &mut Ui, key: &str, open: bool, closed_text: &str, open_text: &str) {
+    let f = ui.font(9.5, FW_NORMAL);
+    let text = if open { open_text } else { closed_text };
+    let start = ui.y;
+    let (cw, ch) = (ui.t.s(7.0) as f32, ui.t.s(3.5) as f32);
+    let (tw, h) = ui.c.measure_text(text, f);
+    let tx = ui.w - tw - ui.t.s(5.0) - cw as i32;
+    ui.c.draw_text(text, tx, ui.y, f, ui.t.accent);
+    let cx = (ui.w - cw as i32) as f32;
+    let cy = ui.y as f32 + h as f32 / 2.0 + 1.0;
+    let (top, tip) = if open { (cy + ch / 2.0, cy - ch / 2.0) } else { (cy - ch / 2.0, cy + ch / 2.0) };
+    let width = ui.t.s(1.2) as f32;
+    ui.c.draw_line(cx, top, cx + cw / 2.0, tip, width, ui.t.accent);
+    ui.c.draw_line(cx + cw / 2.0, tip, cx + cw, top, width, ui.t.accent);
+    ui.y += h + ui.t.s(3.0);
+    ui.clickable(start, Action::Expand(key.to_string()));
+}
+
+/// A text field in the network popup (ping targets, custom DNS servers), in the look of a
+/// Windows 11 text box: card fill, accent underline (red after a refused entry), selection,
+/// caret, and a hint line.
+fn ping_field(ui: &mut Ui, e: &EditView) {
+    let dns = e.slot == 2;
+    let title = match e.slot {
+        0 => t("power.ping_off_title"),
+        1 => format!("{} 2", t("power.ping_off_title")),
+        _ => t("power.dns_custom_title"),
+    };
+    ui.section(&title);
+    for (i, fv) in e.fields.iter().enumerate() {
+        let focused = i == e.focus;
+        if dns {
+            // which server this is, above the field
+            let fc = ui.font(9.5, FW_NORMAL);
+            let (_, ch) = ui.c.draw_text(&t(if i == 0 { "power.dns_primary" } else { "power.dns_secondary" }), 0, ui.y, fc, ui.t.dim);
+            ui.y += ch + ui.t.s(3.0);
+        }
+        let h = ui.t.s(32.0);
+        let r = ui.t.s(6.0) as f32;
+        let top = ui.y;
+        let (fill, stroke) = ui.t.style.card(ui.t.light);
+        ui.c.fill_round_rect(0, top, ui.w, h, r, fill);
+        if focused {
+            // a touch stronger than a card: it has the keyboard
+            ui.c.fill_round_rect(0, top, ui.w, h, r, ui.t.text.alpha(0.04));
+        }
+        ui.c.stroke_round_rect_r(0, top, ui.w, h, r, stroke.unwrap_or(ui.t.dim.alpha(0.22)));
+        let lh = ui.t.s(if focused { 2.0 } else { 1.0 });
+        let line = if e.error && focused { RED } else if focused { ui.t.accent } else { ui.t.dim.alpha(0.5) };
+        ui.c.fill_round_rect(ui.t.s(1.0), top + h - lh, ui.w - ui.t.s(2.0), lh, lh as f32 / 2.0, line);
+        let f = ui.font(11.5, FW_NORMAL);
+        let pad = ui.t.s(10.0);
+        let th = ui.c.measure_text("Xg", f).1;
+        let ty = top + (h - th) / 2 - ui.t.s(1.0);
+        let max_w = ui.w - pad * 2;
+        if fv.text.is_empty() {
+            let ph = match (dns, i) {
+                (false, _) => t("power.ping_placeholder"),
+                (true, 0) => t("power.dns_placeholder"),
+                (true, _) => t("power.dns_placeholder2"),
+            };
+            ui.c.draw_text_clipped(&ph, pad, ty, max_w, f, ui.t.dim.alpha(0.6));
+        } else {
+            let tw = ui.c.measure_text(&fv.text, f).0.min(max_w);
+            if fv.all && focused {
+                ui.c.fill_round_rect(pad - ui.t.s(2.0), ty, tw + ui.t.s(4.0), th, ui.t.s(2.0) as f32, ui.t.accent.alpha(0.38));
+            }
+            ui.c.draw_text_clipped(&fv.text, pad, ty, max_w, f, ui.t.text);
+        }
+        if focused && e.caret_on && !fv.all {
+            let cx = pad + ui.c.measure_text(&fv.before, f).0.min(max_w);
+            ui.c.fill_rect(cx, ty + ui.t.s(1.0), ui.t.s(1.0).max(1), th - ui.t.s(2.0), ui.t.text);
+        }
+        // a click on a field puts the keyboard there and keeps the edit going
+        ui.y = top + h;
+        ui.clickable(top, Action::EditFocus(i as u8));
+        ui.y = top + h + ui.t.s(5.0);
+    }
+    let fh = ui.font(9.0, FW_NORMAL);
+    let (hint, col) = match (e.error, dns) {
+        (true, false) => (t("power.ping_invalid"), RED),
+        (true, true) => (t("power.dns_invalid"), RED),
+        (false, false) => (t("power.ping_hint"), ui.t.dim),
+        (false, true) => (t("power.dns_hint"), ui.t.dim),
+    };
+    battery_view::wrap(ui, &hint, fh, col);
+    ui.y += ui.t.s(4.0);
 }
 
 fn draw_disk(ui: &mut Ui, m: &MetricsData) {

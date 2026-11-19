@@ -17,6 +17,7 @@ mod style;
 mod taskbar;
 mod update;
 mod util;
+mod textfield;
 mod widgets;
 
 use canvas::{BLACK, Canvas, Color, WHITE};
@@ -98,6 +99,14 @@ struct App {
     tip_items: Vec<(RECT, String)>,
     /// ICMP probe for the latency rows of the network popup
     ping: metrics::ping::Ping,
+    /// the second ping target (config ping_host2)
+    ping2: metrics::ping::Ping,
+    /// last DNS read of the active interface, while the network popup is open
+    dns_at: Option<std::time::Instant>,
+    /// DNS response times, measured when the network popup opens
+    dns_bench: metrics::dns::Bench,
+    /// the local network popup was open on the last tick
+    net_was_open: bool,
     sleep: metrics::sleepdrain::SleepTracker,
     keep_awake: bool,
     /// this machine served to other winstats (Remote > Share this machine)
@@ -352,6 +361,10 @@ fn main() {
             tip_bar: HWND::default(),
             tip_items: Vec::new(),
             ping: metrics::ping::Ping::new(&cfg.ping_host),
+            ping2: metrics::ping::Ping::new(&cfg.ping_host2),
+            dns_at: None,
+            dns_bench: Default::default(),
+            net_was_open: false,
             sleep: metrics::sleepdrain::SleepTracker::load(),
             keep_awake: false,
             share: None,
@@ -700,6 +713,40 @@ impl App {
         self.metrics.net_ping_host = if self.cfg.ping_host.is_empty() || target.is_empty() { self.cfg.ping_host.clone() } else { target };
         self.metrics.net_latency = lat;
         self.metrics.net_jitter = jit;
+        self.ping2.set(net_open, &self.cfg.ping_host2);
+        let (lat, jit, target) = self.ping2.read();
+        self.metrics.net_ping_host2 = if self.cfg.ping_host2.is_empty() || target.is_empty() { self.cfg.ping_host2.clone() } else { target };
+        self.metrics.net_latency2 = lat;
+        self.metrics.net_jitter2 = jit;
+        // DNS of the active interface, while the network popup shows it
+        if net_open && self.dns_at.map_or(true, |t| t.elapsed().as_secs() >= 5) {
+            self.dns_at = Some(std::time::Instant::now());
+            self.metrics.dns = metrics::dns::read(&self.metrics.net_iface);
+            self.metrics.dns_custom = self.cfg.dns_custom.clone();
+        }
+        // DNS response times: once per opening (and every 2 min while it stays open), the server
+        // in use first, then the presets, then the user's own
+        if net_open && (!self.net_was_open || self.dns_bench.started.map_or(true, |t| t.elapsed().as_secs() >= 120)) {
+            use std::net::IpAddr;
+            let mut list: Vec<IpAddr> = Vec::new();
+            if let Some(d) = self.metrics.dns.as_ref() {
+                list.extend(d.servers.first().cloned());
+            }
+            for p in metrics::dns::PRESETS {
+                list.extend(p.servers.first().and_then(|s| s.parse::<IpAddr>().ok()));
+            }
+            if let Some(c) = metrics::dns::parse_servers(&self.cfg.dns_custom) {
+                list.extend(c.first().cloned());
+            }
+            let mut seen = Vec::new();
+            list.retain(|ip| if seen.contains(ip) { false } else { seen.push(*ip); true });
+            self.dns_bench.start(list);
+        }
+        self.net_was_open = net_open;
+        let bench = self.dns_bench.snapshot();
+        self.metrics.dns_speed = bench.times;
+        self.metrics.dns_speed_running = bench.running;
+        self.metrics.dns_intercepted = bench.intercepted;
         // standby tracking
         let now_unix = util::now_unix();
         if let Some(b) = self.metrics.data.battery {
@@ -1309,6 +1356,19 @@ unsafe extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             update_result(hwnd, wparam.0 == 1);
             LRESULT(0)
         }
+        WM_APP_DNS_DONE => {
+            // the elevated DNS command finished: show what is set now
+            with_app(|app| {
+                app.metrics.dns_busy = false;
+                log!("dns: command finished, exit code {}", wparam.0);
+                app.metrics.dns = metrics::dns::read(&app.metrics.net_iface);
+                app.dns_at = Some(std::time::Instant::now());
+                if app.popup.visible && app.popup.source.is_none() {
+                    app.render_popup(false);
+                }
+            });
+            LRESULT(0)
+        }
         metrics::net::WM_APP_NET => {
             with_app(|app| {
                 app.metrics.refresh_net();
@@ -1500,10 +1560,17 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             // a row that can be dragged waits for the button to come up (a click) or the mouse
             // to move (a drag); everything else reacts at once
             let pressed = with_app(|app| {
+                let action = app.popup.click(x, y);
+                // a click outside the open text field ends its edit (keeping what was typed)
+                let on_field = matches!(action, Some(popup::Action::EditFocus(_))) || matches!((&action, app.popup.edit.as_ref()), (Some(popup::Action::EditPingHost(s)), Some(e)) if *s == e.slot);
+                if app.popup.edit.is_some() && !on_field {
+                    app.edit_blur();
+                    app.render_popup(false);
+                }
                 if app.popup.press(x, y) {
                     return true;
                 }
-                if let Some(action) = app.popup.click(x, y) {
+                if let Some(action) = action {
                     app.popup_action(action);
                 }
                 false
@@ -1626,9 +1693,35 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            if wparam.0 == 0x1B {
+            let editing = with_app(|app| app.popup.edit.is_some()).unwrap_or(false);
+            if editing {
+                // the text field has the keyboard: Esc ends the edit, not the popup
+                with_app(|app| app.edit_key(wparam.0 as u32));
+            } else if wparam.0 == 0x1B {
                 with_app(|app| app.popup.hide("escape"));
             }
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            with_app(|app| {
+                if let Some(e) = app.popup.edit.as_mut() {
+                    if let Some(c) = char::from_u32(wparam.0 as u32) {
+                        if e.field().insert(c) == textfield::KeyResult::Changed {
+                            app.popup.edit_touched();
+                            app.render_popup(false);
+                        }
+                    }
+                }
+            });
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == popup::EDIT_TIMER => {
+            // caret blink
+            with_app(|app| {
+                if app.popup.visible && app.popup.edit.is_some() {
+                    app.render_popup(false);
+                }
+            });
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -2523,7 +2616,151 @@ fn show_menu() {
     menu_command(cmd);
 }
 
+/// longest ping target accepted (a DNS name is at most 253 characters, a label 63)
+const PING_HOST_MAX: usize = 63;
+/// longest text in one custom DNS field
+const DNS_FIELD_MAX: usize = 100;
+/// posted by the DNS thread when the elevated command is done (wparam = exit code)
+const WM_APP_DNS_DONE: u32 = WM_APP + 0x78;
+
+/// A host name or an IPv4 / IPv6 address, as far as its characters go; empty switches ping off.
+fn ping_host_ok(s: &str) -> bool {
+    s.is_empty() || (s.len() <= PING_HOST_MAX && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '%' | '_')))
+}
+
 impl App {
+    /// A new ping target (slot 0 or 1) from the network popup's field: checked, saved and used
+    /// at once. False (and nothing changed) when it is not a host name or address.
+    fn apply_ping_host(&mut self, slot: u8, text: &str) -> bool {
+        let host = text.trim().to_string();
+        if !ping_host_ok(&host) {
+            log!("ping host rejected: {host:?}");
+            return false;
+        }
+        // the popup is open: probe the new target right away
+        if slot == 0 {
+            self.cfg.ping_host = host.clone();
+            self.ping.set(true, &host);
+            self.metrics.net_ping_host = host.clone();
+            self.metrics.net_latency = None;
+            self.metrics.net_jitter = None;
+        } else {
+            self.cfg.ping_host2 = host.clone();
+            self.ping2.set(true, &host);
+            self.metrics.net_ping_host2 = host.clone();
+            self.metrics.net_latency2 = None;
+            self.metrics.net_jitter2 = None;
+        }
+        self.cfg.save();
+        log!("ping host {} -> {host:?}", slot + 1);
+        true
+    }
+
+    /// Save the user's own DNS servers from the popup fields; None when one is not an IP
+    /// address. Empty clears them.
+    fn save_dns_custom(&mut self, text: &str) -> Option<Vec<std::net::IpAddr>> {
+        let list = if text.trim().is_empty() { Vec::new() } else { metrics::dns::parse_servers(text)? };
+        self.cfg.dns_custom = list.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
+        self.cfg.save();
+        self.metrics.dns_custom = self.cfg.dns_custom.clone();
+        log!("dns: custom servers saved: {:?}", self.cfg.dns_custom);
+        Some(list)
+    }
+
+    /// Enter in the DNS fields: save, then apply (one UAC prompt) when there is anything to set.
+    fn apply_dns_custom(&mut self, text: &str) -> bool {
+        let Some(list) = self.save_dns_custom(text) else {
+            log!("dns: custom servers rejected: {text:?}");
+            return false;
+        };
+        if !list.is_empty() {
+            self.apply_dns(Some(list));
+        }
+        true
+    }
+
+    /// A click outside the open edit: keep what was typed. Ping targets are saved and used when
+    /// valid; DNS servers are saved without being applied (no surprise UAC prompt).
+    fn edit_blur(&mut self) {
+        let Some((slot, text)) = self.popup.edit.as_ref().map(|e| (e.slot, e.texts().join(", "))) else { return };
+        if slot == 2 {
+            if self.save_dns_custom(&text).is_none() {
+                log!("dns: custom servers not saved (not IP addresses): {text:?}");
+            }
+        } else {
+            let current = if slot == 0 { &self.cfg.ping_host } else { &self.cfg.ping_host2 };
+            if text != *current {
+                self.apply_ping_host(slot, &text);
+            }
+        }
+        self.popup.end_edit();
+    }
+
+    /// Set the DNS servers of the active interface (None = automatic) through one elevated
+    /// PowerShell command; a thread waits for it and posts WM_APP_DNS_DONE.
+    fn apply_dns(&mut self, servers: Option<Vec<std::net::IpAddr>>) {
+        let alias = self.metrics.dns.as_ref().map(|d| d.alias.clone()).unwrap_or_else(|| self.metrics.net_iface.clone());
+        let Some(cmd) = metrics::dns::command(&alias, servers.as_deref()) else {
+            log!("dns: no usable interface ({alias:?})");
+            return;
+        };
+        log!("dns: {alias} -> {}", servers.as_ref().map_or("automatic".to_string(), |l| l.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")));
+        let Some(process) = metrics::dns::run_elevated(&cmd) else {
+            return;
+        };
+        self.metrics.dns_busy = true;
+        let hidden = self.hidden.0 as isize;
+        let _ = std::thread::Builder::new().name("dns".into()).spawn(move || {
+            let code = metrics::dns::wait_exit(process);
+            unsafe {
+                let _ = PostMessageW(HWND(hidden as *mut _), WM_APP_DNS_DONE, WPARAM(code as usize), LPARAM(0));
+            }
+        });
+    }
+
+    /// A key while a text field of the network popup is being edited.
+    fn edit_key(&mut self, vk: u32) {
+        use textfield::KeyResult;
+        let ctrl = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0;
+        let r = match self.popup.edit.as_mut() {
+            None => return,
+            // Tab / Shift+Tab: the other field
+            Some(e) if vk == 0x09 => {
+                if e.fields.len() < 2 {
+                    return;
+                }
+                let back = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) } < 0;
+                let n = e.fields.len();
+                let next = if back { (e.focus + n - 1) % n } else { (e.focus + 1) % n };
+                e.focus_on(next);
+                KeyResult::Changed
+            }
+            // Ctrl+V: paste the clipboard's first line
+            Some(e) if vk == 0x56 && ctrl => match util::get_clipboard() {
+                Some(text) => e.field().paste(&text),
+                None => KeyResult::Ignored,
+            },
+            Some(e) => e.field().key(vk, ctrl),
+        };
+        match r {
+            KeyResult::Ignored => return,
+            KeyResult::Changed => self.popup.edit_touched(),
+            KeyResult::Cancel => self.popup.end_edit(),
+            KeyResult::Commit(_) => {
+                let slot = self.popup.edit.as_ref().map_or(0, |e| e.slot);
+                let text = self.popup.edit.as_ref().map(|e| e.texts().join(", ")).unwrap_or_default();
+                let ok = if slot == 2 { self.apply_dns_custom(&text) } else { self.apply_ping_host(slot, &text) };
+                if ok {
+                    self.popup.end_edit();
+                } else if let Some(e) = self.popup.edit.as_mut() {
+                    e.error = true;
+                    e.since = std::time::Instant::now();
+                }
+            }
+        }
+        self.render_popup(false);
+    }
+
     /// Apply a settings change from the context menu, persist it and redraw.
     /// A click on a toggling row in the popup: flip the item in the config, save, re-render.
     fn popup_action(&mut self, action: popup::Action) {
@@ -2531,6 +2768,48 @@ impl App {
             popup::Action::OpenUri(uri) => {
                 self.popup.hide("open settings");
                 util::open_uri(uri);
+                return;
+            }
+            popup::Action::EditPingHost(slot) => {
+                // edited in place: the block becomes a text field
+                if self.popup.edit.is_none() {
+                    let (texts, max) = match slot {
+                        0 => (vec![self.cfg.ping_host.clone()], PING_HOST_MAX),
+                        1 => (vec![self.cfg.ping_host2.clone()], PING_HOST_MAX),
+                        // custom DNS: preferred and alternate server, from the saved list
+                        _ => {
+                            let mut list: Vec<String> = self.cfg.dns_custom.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                            list.resize(2, String::new());
+                            (list, DNS_FIELD_MAX)
+                        }
+                    };
+                    self.popup.start_edit(*slot, &texts, max);
+                    self.render_popup(false);
+                }
+                return;
+            }
+            popup::Action::EditFocus(i) => {
+                if let Some(e) = self.popup.edit.as_mut() {
+                    e.focus_on(*i as usize);
+                }
+                self.popup.edit_touched();
+                self.render_popup(false);
+                return;
+            }
+            popup::Action::DnsCustom => {
+                match metrics::dns::parse_servers(&self.cfg.dns_custom) {
+                    Some(list) => self.apply_dns(Some(list)),
+                    None => self.popup.start_edit(2, &[String::new(), String::new()], DNS_FIELD_MAX),
+                }
+                self.render_popup(false);
+                return;
+            }
+            popup::Action::Dns(i) => {
+                let servers = if *i < 0 { None } else { metrics::dns::PRESETS.get(*i as usize).map(|p| p.servers.iter().filter_map(|s| s.parse().ok()).collect()) };
+                if *i < 0 || servers.is_some() {
+                    self.apply_dns(servers);
+                    self.render_popup(false);
+                }
                 return;
             }
             popup::Action::KeepAwake(on) => {

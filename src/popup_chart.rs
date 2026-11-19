@@ -196,6 +196,7 @@ impl ChartWindow {
             anim_bg: Vec::new(),
             phase: 0.0,
             max_rows: None,
+            ping_edit: None,
             flipped: &self.flipped,
             fold_open: false,
             fold: Vec::new(),
