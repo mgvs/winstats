@@ -1736,7 +1736,7 @@ mod tests {
                     let (text, dim) = if light { (Color::rgb(0x1B, 0x1B, 0x1B), Color::rgba(0x1B, 0x1B, 0x1B, 160)) } else { (Color::rgb(255, 255, 255), Color::rgba(255, 255, 255, 150)) };
                     let theme = Theme {
                         text, dim, accent: if light { Color::rgb(0x00, 0x5F, 0xB8) } else { Color::rgb(0x60, 0xCD, 0xFF) }, outline: None, light, scale: 1.5, inner_h: 20, labels: true, font_scale: 1.0, split_pe: true, chart_w: 34.0, bar_w: 3.0,
-                        modes: [ColorMode::Accent; crate::widgets::MODULE_COUNT], label: None, net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: true, battery_hours: 6, style: crate::style::Style::Windows,
+                        modes: [ColorMode::Accent; crate::widgets::MODULE_COUNT], label: None, net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: true, battery_hours: 6, style: crate::style::Style::Windows, battery_view: Default::default(),
                     };
                     let w = theme.s(super::super::BATTERY_WIDTH_DIP - 28.0);
                     let mut c = Canvas::new();
@@ -1812,7 +1812,7 @@ mod tests {
         for hours in [1u32, 168] {
             let theme = Theme {
                 text: Color::rgb(255, 255, 255), dim: Color::rgba(255, 255, 255, 150), accent: Color::rgb(0x60, 0xCD, 0xFF), outline: None, light: false, scale: 1.5, inner_h: 20, labels: true, font_scale: 1.0, split_pe: true, chart_w: 34.0, bar_w: 3.0,
-                modes: [ColorMode::Accent; crate::widgets::MODULE_COUNT], label: None, net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: true, battery_hours: hours, style: crate::style::Style::Windows,
+                modes: [ColorMode::Accent; crate::widgets::MODULE_COUNT], label: None, net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: true, battery_hours: hours, style: crate::style::Style::Windows, battery_view: Default::default(),
             };
             let m = MetricsData { power_tel: Some(Arc::new(Telemetry { at_unix: now, ..Default::default() })), power_history: Arc::new(hist.clone()), ..Default::default() };
             let (w, h) = (1400, 1050);

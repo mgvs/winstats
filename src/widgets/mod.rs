@@ -51,6 +51,8 @@ pub struct Theme {
     pub modes: [ColorMode; MODULE_COUNT],
     /// vertical label for every widget drawn with this theme (remote machines); None = module name
     pub label: Option<String>,
+    /// how the battery widget is laid out (Battery > View)
+    pub battery_view: BatteryView,
     /// series shown in the network popup chart
     pub net_rx: bool,
     pub net_tx: bool,
@@ -652,7 +654,17 @@ mod speed_order_tests {
             light: false, scale: 1.0, inner_h: 24, labels: true, font_scale: 1.0,
             split_pe: true, chart_w: 34.0, bar_w: 3.0, modes: [mode; MODULE_COUNT], label: None,
             net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: false, battery_hours: 6, style: crate::style::Style::Windows,
+            battery_view: BatteryView::Horizontal,
         }
+    }
+
+    #[test]
+    fn battery_views() {
+        assert_eq!(BatteryView::parse("vertical_pct"), BatteryView::VerticalPct);
+        assert_eq!(BatteryView::parse("compact"), BatteryView::Compact);
+        // an old or mistyped setting falls back to the familiar layout
+        assert_eq!(BatteryView::parse(""), BatteryView::Horizontal);
+        assert_eq!(BatteryView::parse("sideways"), BatteryView::Horizontal);
     }
 
     #[test]
@@ -788,7 +800,73 @@ impl Widget for DualChart {
 
 // ---------------------------------------------------------------- Battery
 
+/// The battery widget's layouts (Battery > View).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BatteryView {
+    /// "100% [■■■ ]"
+    #[default]
+    Horizontal,
+    /// the battery with the percentage under it
+    Compact,
+    /// an upright battery filling from the bottom
+    Vertical,
+    /// the upright battery with the percentage under it
+    VerticalPct,
+}
+
+impl BatteryView {
+    /// (view, config name, menu text key), in menu order
+    pub const ALL: [(BatteryView, &'static str, &'static str); 4] = [
+        (BatteryView::Horizontal, "horizontal", "menu.battery_horizontal"),
+        (BatteryView::Compact, "compact", "menu.battery_compact"),
+        (BatteryView::Vertical, "vertical", "menu.battery_vertical"),
+        (BatteryView::VerticalPct, "vertical_pct", "menu.battery_vertical_pct"),
+    ];
+
+    pub fn parse(name: &str) -> Self {
+        Self::ALL.iter().find(|v| v.1 == name).map_or(BatteryView::Horizontal, |v| v.0)
+    }
+}
+
 pub struct BatteryWidget;
+
+/// The fill: green while plugged in, red / yellow when low, the text colour otherwise.
+fn battery_fill(b: &crate::metrics::battery::Battery, t: &Theme) -> Color {
+    if b.charging || b.on_ac {
+        GREEN
+    } else if b.level < 0.15 {
+        RED
+    } else if b.level < 0.3 {
+        YELLOW
+    } else {
+        t.text
+    }
+}
+
+/// Where the digits sit in a text cell `cell_h` high (Segoe UI: the cell is 1.33 em; the
+/// digits stand from 0.38 em to 1.08 em): (offset of their top, their height).
+fn digit_ink(cell_h: i32) -> (i32, i32) {
+    let em = cell_h as f32 / 1.33;
+    ((em * 0.38).round() as i32, (em * 0.70).round() as i32)
+}
+
+/// A battery lying down at (bx, by), its nub on the right, filled from the left.
+fn battery_h(c: &mut Canvas, t: &Theme, bx: i32, by: i32, bw: i32, bh: i32, level: f32, fill: Color) {
+    c.stroke_round_rect(bx, by, bw, bh, t.caption());
+    c.fill_rect(bx + bw, by + bh / 2 - t.s(1.5), t.s(1.5), t.s(3.0), t.caption());
+    let fw = (((bw - 4) as f32) * level).round().max(1.0) as i32;
+    c.fill_rect(bx + 2, by + 2, fw, bh - 4, fill);
+}
+
+/// A battery standing up at (bx, by), its nub on top, filled from the bottom.
+fn battery_v(c: &mut Canvas, t: &Theme, bx: i32, by: i32, bw: i32, bh: i32, level: f32, fill: Color) {
+    let nub = t.s(1.5);
+    c.fill_rect(bx + bw / 2 - t.s(1.5), by, t.s(3.0), nub, t.caption());
+    let (by, bh) = (by + nub, bh - nub);
+    c.stroke_round_rect(bx, by, bw, bh, t.caption());
+    let fh = (((bh - 4) as f32) * level).round().max(1.0) as i32;
+    c.fill_rect(bx + 2, by + bh - 2 - fh, bw - 4, fh, fill);
+}
 
 impl Widget for BatteryWidget {
     fn kind(&self) -> Kind {
@@ -798,34 +876,54 @@ impl Widget for BatteryWidget {
         if m.battery.is_none() {
             return 0;
         }
-        let f = t.font(9.0, FW_NORMAL);
-        c.measure_text("100%", f).0 + t.s(3.0) + t.s(22.0)
+        match t.battery_view {
+            BatteryView::Horizontal => c.measure_text("100%", t.font(9.0, FW_NORMAL)).0 + t.s(3.0) + t.s(22.0),
+            BatteryView::Compact => c.measure_text("100%", t.font(8.0, FW_NORMAL)).0.max(t.s(22.0)),
+            BatteryView::Vertical => t.s(11.0),
+            BatteryView::VerticalPct => c.measure_text("100%", t.font(8.0, FW_NORMAL)).0.max(t.s(11.0)),
+        }
     }
 
     fn draw(&self, c: &mut Canvas, x: i32, y: i32, t: &Theme, m: &MetricsData) {
         let Some(b) = m.battery else { return };
-        let f = t.font(9.0, FW_NORMAL);
+        let fill = battery_fill(&b, t);
         let text = format!("{}%", (b.level * 100.0).round() as i32);
-        let (tw, th) = c.measure_text(&text, f);
-        c.draw_text(&text, x, y + (t.inner_h - th) / 2, f, t.text);
-        let bx = x + tw + t.s(3.0);
-        let bw = t.s(20.0);
-        let bh = t.s(10.0);
-        let by = y + (t.inner_h - bh) / 2;
-        c.stroke_round_rect(bx, by, bw, bh, t.caption());
-        c.fill_rect(bx + bw, by + bh / 2 - t.s(1.5), t.s(1.5), t.s(3.0), t.caption()); // nub
-        let fill_col = if b.charging || b.on_ac {
-            GREEN
-        } else if b.level < 0.15 {
-            RED
-        } else if b.level < 0.3 {
-            YELLOW
-        } else {
-            t.text
-        };
-        let inner = bw - 4;
-        let fw = ((inner as f32) * b.level).round().max(1.0) as i32;
-        c.fill_rect(bx + 2, by + 2, fw, bh - 4, fill_col);
+        let w = self.width(c, t, m);
+        match t.battery_view {
+            BatteryView::Horizontal => {
+                let f = t.font(9.0, FW_NORMAL);
+                let (tw, th) = c.measure_text(&text, f);
+                c.draw_text(&text, x, y + (t.inner_h - th) / 2, f, t.text);
+                let (bw, bh) = (t.s(20.0), t.s(10.0));
+                battery_h(c, t, x + tw + t.s(3.0), y + (t.inner_h - bh) / 2, bw, bh, b.level, fill);
+            }
+            BatteryView::Compact => {
+                // the battery over the percentage, the pair centred in the row by what is seen
+                // of the digits (the text cell has room above and below them)
+                let f = t.font(8.0, FW_NORMAL);
+                let (tw, th) = c.measure_text(&text, f);
+                let (ink_top, ink_h) = digit_ink(th);
+                let (bw, bh) = (t.s(20.0), t.s(8.0));
+                let gap = t.s(3.0);
+                let top = y + (t.inner_h - bh - gap - ink_h) / 2;
+                battery_h(c, t, x + (w - bw - t.s(1.5)) / 2, top, bw, bh, b.level, fill);
+                c.draw_text(&text, x + (w - tw) / 2, top + bh + gap - ink_top, f, t.text);
+            }
+            BatteryView::Vertical => {
+                let (bw, bh) = (t.s(9.0), t.inner_h - t.s(2.0));
+                battery_v(c, t, x + (w - bw) / 2, y + t.s(1.0), bw, bh, b.level, fill);
+            }
+            BatteryView::VerticalPct => {
+                let f = t.font(8.0, FW_NORMAL);
+                let (tw, th) = c.measure_text(&text, f);
+                let (ink_top, ink_h) = digit_ink(th);
+                let gap = t.s(3.0);
+                let (bw, bh) = (t.s(9.0), (t.inner_h - ink_h - gap).max(t.s(8.0)));
+                let top = y + (t.inner_h - bh - gap - ink_h) / 2;
+                battery_v(c, t, x + (w - bw) / 2, top, bw, bh, b.level, fill);
+                c.draw_text(&text, x + (w - tw) / 2, top + bh + gap - ink_top, f, t.text);
+            }
+        }
     }
 }
 

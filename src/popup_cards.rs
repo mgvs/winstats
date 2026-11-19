@@ -100,7 +100,7 @@ mod style_tests {
                 let accent = if style.system_accent() { crate::util::system_accent_for(light).unwrap() } else { crate::widgets::named_color("blue").unwrap() };
                 let theme = Theme {
                     text, dim, accent, outline: None, light, scale: 1.25, inner_h: 20, labels: true, font_scale: 1.0, split_pe: true, chart_w: 34.0, bar_w: 3.0,
-                    modes, label: None, net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: true, battery_hours: 6, style,
+                    modes, label: None, net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: true, battery_hours: 6, style, battery_view: Default::default(),
                 };
                 for kind in 0..2 {
                     let w = theme.s(if kind == 0 { 400.0 } else { 300.0 } - 28.0);

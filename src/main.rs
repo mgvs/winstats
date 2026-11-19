@@ -155,6 +155,7 @@ fn remote_theme(cfg: &Config, base: &Theme, key: &str) -> Theme {
         t.label = Some(if rc.label.is_empty() { key.to_string() } else { rc.label.clone() });
         t.labels = rc.labels;
         t.split_pe = rc.split_pe;
+        t.battery_view = widgets::BatteryView::parse(&rc.battery_view);
     } else {
         t.label = Some(key.to_string());
     }
@@ -581,6 +582,7 @@ impl App {
                 _ => self.cfg.animations && util::animations_enabled(),
             },
             style,
+            battery_view: widgets::BatteryView::parse(&self.cfg.battery_view),
             battery_hours: match self.cfg.battery_history_hours {
                 // 0 = since unplugged; 72 / 168 = 3 / 7 days (the large view)
                 h @ (0 | 1 | 6 | 24 | 72 | 168) => h,
@@ -1691,6 +1693,8 @@ const MENU_REMOTE_DISCOVERY: usize = 700;
 const MENU_REMOTE_SHARE: usize = 701;
 /// opens the dialog that adds a machine discovery cannot reach (another network, a cloud VM)
 const MENU_REMOTE_ADD: usize = 702;
+/// + index in `BatteryView::ALL`: the battery widget's layout
+const MENU_BATTERY_VIEW_BASE: usize = 540;
 /// opens the agent quickstart page
 const MENU_REMOTE_INSTALL: usize = 703;
 const MENU_DISPLAY_BASE: usize = 1000;
@@ -1711,6 +1715,8 @@ const RM_LABELS: usize = 6;
 const RM_EDIT_LABEL: usize = 7;
 /// opens the dialog that edits the machine's token
 const RM_EDIT_TOKEN: usize = 8;
+/// + index in `BatteryView::ALL`: the machine's battery widget layout
+const RM_BATTERY_VIEW: usize = 160;
 /// + CATALOG index: stretch that chart of the machine (vertical taskbar)
 const RM_STRETCH: usize = 140;
 const TOP_COUNTS: &[u32] = &[5, 8, 10, 15, 20];
@@ -1808,6 +1814,13 @@ unsafe fn remote_menu(cfg: &Config, entries: &[RemoteEntry], dpi: u32, vertical:
                             let cb = base + RM_COLOR + mi * RM_COLOR_STRIDE;
                             color_entries(cs, cb, current, cfg, dpi);
                             menu_submenu(ms, cs, &t("menu.colour"));
+                        } else {
+                            let current = widgets::BatteryView::parse(rc.map_or("horizontal", |r| r.battery_view.as_str()));
+                            let vs = CreatePopupMenu().ok()?;
+                            for (i, (v, _, title)) in widgets::BatteryView::ALL.iter().enumerate() {
+                                menu_item(vs, base + RM_BATTERY_VIEW + i, &t(title), *v == current);
+                            }
+                            menu_submenu(ms, vs, &t("menu.battery_view"));
                         }
                         if *kind == Kind::Cpu && e.splittable {
                             // one divider setting for P / E boundaries, clusters and sockets
@@ -1911,6 +1924,13 @@ unsafe fn build_menu(st: &MenuState) -> Option<HMENU> {
                 if let Some(cs) = color_submenu(cfg, mi, *kind, dpi) {
                     menu_submenu(sub, cs, &t("menu.colour"));
                 }
+            } else {
+                let current = widgets::BatteryView::parse(&cfg.battery_view);
+                let vs = CreatePopupMenu().ok()?;
+                for (i, (v, _, title)) in widgets::BatteryView::ALL.iter().enumerate() {
+                    menu_item(vs, MENU_BATTERY_VIEW_BASE + i, &t(title), *v == current);
+                }
+                menu_submenu(sub, vs, &t("menu.battery_view"));
             }
             if *kind == Kind::Cpu && splittable {
                 menu_item(sub, MENU_SPLIT_PE, &t(if hybrid { "menu.show_pe_splitter" } else { "menu.show_splitter" }), cfg.split_pe_cores);
@@ -2784,6 +2804,11 @@ impl App {
                     self.popup.hide("forget");
                 }
             }
+            (Some(key), v) if (RM_BATTERY_VIEW..RM_BATTERY_VIEW + widgets::BatteryView::ALL.len()).contains(&v) => {
+                if let Some(rc) = self.cfg.remotes.get_mut(&key) {
+                    rc.battery_view = widgets::BatteryView::ALL[v - RM_BATTERY_VIEW].1.into();
+                }
+            }
             (Some(key), RM_LABELS) => {
                 if let Some(rc) = self.cfg.remotes.get_mut(&key) {
                     rc.labels = !rc.labels;
@@ -2848,6 +2873,9 @@ impl App {
             MENU_SPLIT_PE => self.cfg.split_pe_cores = !self.cfg.split_pe_cores,
             MENU_NET_BYTES => self.cfg.net_unit = "bytes".into(),
             MENU_NET_BITS => self.cfg.net_unit = "bits".into(),
+            c if (MENU_BATTERY_VIEW_BASE..MENU_BATTERY_VIEW_BASE + widgets::BatteryView::ALL.len()).contains(&c) => {
+                self.cfg.battery_view = widgets::BatteryView::ALL[c - MENU_BATTERY_VIEW_BASE].1.into();
+            }
             MENU_NET_UPLOAD_FIRST => self.cfg.net_upload_first = !self.cfg.net_upload_first,
             MENU_TEMP_CELSIUS => self.cfg.temp_unit = "celsius".into(),
             MENU_TEMP_FAHRENHEIT => self.cfg.temp_unit = "fahrenheit".into(),

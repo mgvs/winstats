@@ -56,6 +56,8 @@ pub struct Config {
     pub popup_more: Vec<String>,
     /// "Where the memory goes" in the memory popup as one bar instead of the pie chart
     pub mem_breakdown_bar: bool,
+    /// The battery widget's layout: "horizontal", "compact", "vertical", "vertical_pct"
+    pub battery_view: String,
     /// The GPU popup's process list ordered by video memory instead of GPU load
     pub gpu_procs_by_vram: bool,
     /// How many times winstats has started (the agent hint waits for the second start)
@@ -158,6 +160,7 @@ impl Default for Config {
             proc_show_user: true,
             popup_more: Vec::new(),
             mem_breakdown_bar: false,
+            battery_view: "horizontal".into(),
             gpu_procs_by_vram: false,
             launches: 0,
             agent_hint_shown: false,
@@ -217,6 +220,8 @@ pub struct RemoteCfg {
     pub popup_rows: Vec<String>,
     /// this machine's order of the popup rows, like `Config::popup_order`
     pub popup_order: Vec<String>,
+    /// this machine's battery widget layout, like `Config::battery_view`
+    pub battery_view: String,
 }
 
 impl Default for RemoteCfg {
@@ -236,6 +241,7 @@ impl Default for RemoteCfg {
             group_pe: false,
             popup_rows: Vec::new(),
             popup_order: Vec::new(),
+            battery_view: "horizontal".into(),
         }
     }
 }
