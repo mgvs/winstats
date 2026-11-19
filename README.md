@@ -21,6 +21,11 @@ Click a widget for its popup (the Network one shows the tooltip that opens over 
 |---|---|---|
 | ![Disk popup](docs/popup-disk.png) | ![GPU popup](docs/popup-gpu.png) | ![CPU popup of an ARM node](docs/popup-remote-cpu.png) |
 
+The battery of a remote MacBook through its agent, plugged in but drawing on its battery for the moment: where the
+power goes, the pack's readings and the history (in Russian; on the strip the battery widget in its compact layout):
+
+![Battery popup of a remote MacBook](docs/popup-battery-remote.png)
+
 Right click for the settings menu. The interface comes in 29 languages (see Configuration); the menu in
 English and Ukrainian, the popups in Greek and Ukrainian:
 
