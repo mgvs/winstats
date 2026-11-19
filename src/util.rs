@@ -86,6 +86,29 @@ pub fn load_system_dll(name: PCWSTR) -> Option<windows::Win32::Foundation::HMODU
     unsafe { LoadLibraryW(PCWSTR(path.as_ptr())).ok() }
 }
 
+/// Open a URI (ms-settings:..., https://...) with its registered handler.
+pub fn open_uri(uri: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let (op, target) = (wide("open"), wide(uri));
+    let r = unsafe { ShellExecuteW(windows::Win32::Foundation::HWND::default(), pcwstr(&op), pcwstr(&target), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+    if r.0 as isize <= 32 {
+        log(&format!("open {uri} failed: {}", r.0 as isize));
+    }
+}
+
+/// Windows "Animation effects" (Accessibility > Visual effects) is on.
+pub fn animations_enabled() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+    let mut on = windows::Win32::Foundation::BOOL(1);
+    unsafe {
+        if SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_err() {
+            return true;
+        }
+    }
+    on.as_bool()
+}
+
 /// Windows 8 is build 9200; anything older cannot host layered child windows.
 pub fn is_windows7() -> bool {
     windows_build() < 9200
@@ -144,6 +167,10 @@ pub fn config_dir() -> std::path::PathBuf {
 
 pub fn log(msg: &str) {
     eprintln!("{msg}");
+    // unit tests must not write into the real log
+    if cfg!(test) {
+        return;
+    }
     let dir = config_dir();
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -326,6 +353,24 @@ pub fn format_size(b: u64) -> String {
     }
 }
 
+/// The accent shade Windows itself uses for accent fills on this background (Fluent
+/// AccentFillColorDefault): "Light 2" on dark, "Dark 1" on light, from the accent palette the
+/// shell derives from the accent colour. A deep accent stays itself, just lighter or darker,
+/// instead of being replaced by grey.
+pub fn system_accent_for(light_bg: bool) -> Option<crate::canvas::Color> {
+    use windows::Win32::System::Registry::RRF_RT_REG_BINARY;
+    let (k, v) = (wide(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"), wide("AccentPalette"));
+    let mut buf = [0u8; 32];
+    let mut size = buf.len() as u32;
+    let ok = unsafe { RegGetValueW(HKEY_CURRENT_USER, pcwstr(&k), pcwstr(&v), RRF_RT_REG_BINARY, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut size)) } == ERROR_SUCCESS;
+    if !ok || size < 32 {
+        return None;
+    }
+    // 8 RGBA entries: Light 3, Light 2, Light 1, Base, Dark 1, Dark 2, Dark 3, unused
+    let i = if light_bg { 4 } else { 1 } * 4;
+    Some(crate::canvas::Color::rgb(buf[i], buf[i + 1], buf[i + 2]))
+}
+
 /// Windows accent colour (DWM colorization), if available.
 pub fn system_accent_color() -> Option<crate::canvas::Color> {
     let mut argb: u32 = 0;
@@ -362,4 +407,9 @@ pub fn set_clipboard(text: &str) -> bool {
         let _ = CloseClipboard();
         ok
     }
+}
+
+/// Wall-clock seconds since 1970.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }

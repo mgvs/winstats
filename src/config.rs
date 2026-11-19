@@ -110,6 +110,15 @@ pub struct Config {
     /// How the strip is hosted: "auto" (floating on Windows 7, embedded otherwise),
     /// "embedded" (child of the taskbar) or "floating" (always-on-top window over the taskbar).
     pub mode: String,
+    /// Smooth popup animations (the battery power flow); off also when Windows turns animation
+    /// effects off or energy saver is on.
+    pub animations: bool,
+    /// Look of the strip and the popups: "windows" (like the taskbar) | "vivid" | "mono" | "classic"
+    pub style: String,
+    /// Hours of history in the battery popup charts: 1 | 6 | 24
+    pub battery_history_hours: u32,
+    /// Moving flows and glides: "auto" (as Windows' animation effects), "on", "off"
+    pub animation_mode: String,
 }
 
 impl Default for Config {
@@ -172,6 +181,10 @@ impl Default for Config {
             share_name: String::new(),
             share_port: 47778,
             share_token: String::new(),
+            animations: true,
+            style: "windows".into(),
+            battery_history_hours: 6,
+            animation_mode: "auto".into(),
         }
     }
 }
@@ -303,6 +316,13 @@ mod tests {
             let loaded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
             assert_eq!(loaded.net_upload_first, upload_first);
         }
+    }
+
+    #[test]
+    fn old_configs_get_battery_defaults() {
+        let cfg: Config = toml::from_str("update_ms = 2000").unwrap();
+        assert!(cfg.animations);
+        assert_eq!(cfg.battery_history_hours, 6);
     }
 
     #[test]

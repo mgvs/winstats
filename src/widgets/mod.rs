@@ -48,7 +48,7 @@ pub struct Theme {
     /// width of one core bar in DIP (Bar width in the menu)
     pub bar_w: f32,
     /// colour mode per module, indexed like MODULES
-    pub modes: [ColorMode; 6],
+    pub modes: [ColorMode; MODULE_COUNT],
     /// vertical label for every widget drawn with this theme (remote machines); None = module name
     pub label: Option<String>,
     /// series shown in the network popup chart
@@ -60,6 +60,12 @@ pub struct Theme {
     pub net_upload_first: bool,
     /// Show local and remote temperatures in Fahrenheit.
     pub temp_f: bool,
+    /// popup animations allowed (config, Windows animation effects)
+    pub animate: bool,
+    /// hours shown by the battery history charts
+    pub battery_hours: u32,
+    /// visual style preset
+    pub style: crate::style::Style,
 }
 
 impl Theme {
@@ -208,6 +214,9 @@ pub const CATALOG: &[(Kind, &str, &str)] = &[
 ];
 
 pub const MODULES: &[Kind] = &[Kind::Cpu, Kind::Gpu, Kind::Mem, Kind::Disk, Kind::Net, Kind::Battery];
+/// Per-module settings (colour modes) are kept in arrays of this size.
+pub const MODULE_COUNT: usize = 6;
+const _: () = assert!(MODULES.len() == MODULE_COUNT);
 
 /// True for the history-chart widgets (the ones that can be stretched on a vertical taskbar).
 pub fn is_chart(name: &str) -> bool {
@@ -641,8 +650,8 @@ mod speed_order_tests {
         Theme {
             text: WHITE, dim: Color::rgb(128, 128, 128), accent: BLUE, outline: None,
             light: false, scale: 1.0, inner_h: 24, labels: true, font_scale: 1.0,
-            split_pe: true, chart_w: 34.0, bar_w: 3.0, modes: [mode; 6], label: None,
-            net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false,
+            split_pe: true, chart_w: 34.0, bar_w: 3.0, modes: [mode; MODULE_COUNT], label: None,
+            net_rx: true, net_tx: true, net_bits: false, net_upload_first: false, temp_f: false, animate: false, battery_hours: 6, style: crate::style::Style::Windows,
         }
     }
 

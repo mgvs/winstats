@@ -1,8 +1,14 @@
 pub mod amd;
 pub mod battery;
+pub mod controls;
 pub mod cpu;
 pub mod disks;
+pub mod displays;
 pub mod drives;
+pub mod emi;
+pub mod power;
+pub mod powermodel;
+pub mod powerflow;
 pub mod gpu;
 pub mod gpuperf;
 pub mod gpustats;
@@ -13,6 +19,8 @@ pub mod nvidia;
 pub mod ping;
 pub mod pdh;
 pub mod processes;
+pub mod quick;
+pub mod sleepdrain;
 pub mod smbios;
 pub mod sysinfo;
 
@@ -70,6 +78,12 @@ pub struct MetricsData {
     /// ms, from the ICMP probe while the popup is open
     pub net_latency: Option<f32>,
     pub net_jitter: Option<f32>,
+    /// WinStats keeps the PC and screen awake
+    pub keep_awake: bool,
+    /// screen-off timeouts of the power plan, seconds (on AC, on battery)
+    pub screen_off: Option<(u32, u32)>,
+    /// standbys on battery, oldest first
+    pub sleeps: Vec<sleepdrain::SleepEvent>,
     pub disk_read: f64,
     pub disk_write: f64,
     pub disk_history: VecDeque<(f32, f32)>,
@@ -97,6 +111,10 @@ pub struct MetricsData {
     pub vram_total: u64,
     pub battery: Option<battery::Battery>,
     pub battery_detail: Option<battery::BatteryDetail>,
+    /// full battery / power telemetry from the power worker (local machine only)
+    pub power_tel: Option<std::sync::Arc<power::Telemetry>>,
+    /// battery level and power on a 30 s grid, oldest first (local machine only)
+    pub power_history: std::sync::Arc<Vec<power::HistPoint>>,
     pub top_cpu: Vec<processes::ProcInfo>,
     pub top_mem: Vec<processes::ProcInfo>,
     pub top_io: Vec<processes::ProcInfo>,
@@ -247,6 +265,8 @@ pub struct Metrics {
     pub want_per_disk: bool,
     /// the local GPU popup is open: read the GPU sensors, processes and vendor libraries
     pub gpu_details: bool,
+    /// the local battery popup is open: read the power settings and GPU power states
+    pub control_details: bool,
     /// popup-only counters; opened the first time a popup shows details
     details: Option<pdh::Details>,
     /// the details query could not be opened: do not retry every tick
@@ -259,6 +279,10 @@ pub struct Metrics {
     proc_at: Option<std::time::Instant>,
     /// the process lists were just refreshed: the GPU list follows on this tick
     procs_fresh: bool,
+    /// battery / energy meter worker; None on machines without a battery
+    pub power_mon: Option<power::PowerMonitor>,
+    /// reads the battery popup's firmware and power settings off the UI thread
+    controls: controls::ControlsWorker,
     /// load history of every adapter by LUID: switching adapters in the popup shows the chosen
     /// one's own past instead of continuing the previous one's line
     gpu_histories: std::collections::HashMap<u64, VecDeque<f32>>,
@@ -342,6 +366,10 @@ impl Metrics {
             proc_interval_ms: 2000,
             proc_at: None,
             procs_fresh: false,
+            control_details: false,
+            controls: controls::ControlsWorker::start(),
+            // batteries and / or energy meters (CPU package power on desktops too)
+            power_mon: (battery_available || emi::Meters::available()).then(|| power::PowerMonitor::start(1000)),
             gpu_histories: Default::default(),
             vram_histories: Default::default(),
             gpu_by_vram: false,
@@ -395,6 +423,18 @@ impl Metrics {
     pub fn set_top_n(&mut self, n: usize) {
         self.procs.top_n = n.max(1);
         self.data.top_n = self.procs.top_n;
+    }
+
+    /// Read the controls now, on this thread (on opening, and right after a setting changed).
+    pub fn read_controls(&mut self) {
+        let s = controls::read();
+        self.controls.put(s.clone());
+        self.apply_controls(s);
+    }
+
+    fn apply_controls(&mut self, s: controls::Snapshot) {
+        self.gpu_dev.set_power_states(&s.gpu_states);
+        self.data.screen_off = s.screen_off;
     }
 
     /// Called when the popup opens so the first per-process sample is not garbage.
@@ -533,6 +573,15 @@ impl Metrics {
     }
 
     pub fn update(&mut self, details: bool) {
+        // screen timeouts and GPU power states: only while the battery popup shows them, read on
+        // the controls thread; only the first tick after opening reads here
+        self.controls.set_active(self.control_details, 1000);
+        if self.control_details {
+            match self.controls.snapshot() {
+                Some(s) => self.apply_controls(s),
+                None => self.read_controls(),
+            }
+        }
         let d = &mut self.data;
         self.cpu.update();
         d.cpu_cores = self.cpu_order.iter().map(|&i| self.cpu.cores.get(i).cloned().unwrap_or(0.0)).collect();
@@ -566,6 +615,23 @@ impl Metrics {
                 d.gpu = self.gpu_dev.set_loads(&p.gpu_loads);
                 d.gpu_adapters = self.gpu_dev.adapters.clone();
             }
+        }
+        if self.control_details && !self.gpu_details {
+            // battery popup: is each discrete GPU asleep? Its board power only while it is awake
+            // and busy anyway: reading a sleeping (or idle) Optimus GPU wakes it or keeps it up
+            let busy = gpu::discrete_indices(&self.gpu_dev.adapters, &d.cpu_name).into_iter().find(|&i| {
+                let a = &self.gpu_dev.adapters[i];
+                a.d_state == Some(0) && a.load.unwrap_or(0.0) > 0.03
+            });
+            match busy {
+                Some(i) => self.gpu_dev.update_perf_for(i),
+                None => self.gpu_dev.stop_perf(),
+            }
+            d.gpu_adapters = self.gpu_dev.adapters.clone();
+        } else if !self.gpu_details {
+            self.gpu_dev.stop_perf();
+        }
+        if let Some(p) = self.pdh.as_mut() {
             let mut raw = p.core_freqs();
             if raw.is_empty() {
                 raw = sysinfo::current_clocks();
@@ -620,6 +686,10 @@ impl Metrics {
         }
 
         d.battery = battery::read();
+        if let Some((t, h)) = self.power_mon.as_mut().and_then(|p| p.take()) {
+            d.power_tel = Some(t);
+            d.power_history = h;
+        }
         if !details || !self.gpu_details {
             // the sensor thread reads only while the GPU popup is open
             self.gpu_dev.stop_perf();

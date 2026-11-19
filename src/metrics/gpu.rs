@@ -25,6 +25,90 @@ pub struct AdapterInfo {
     /// GPU memory in use on this adapter (popup only, GPU Adapter Memory counters), bytes
     pub dedicated_used: Option<u64>,
     pub shared_used: Option<u64>,
+    /// device power state from Windows (0 = D0 awake, 3 = D3 asleep); battery popup only
+    pub d_state: Option<u8>,
+}
+
+/// The chip's own graphics among the adapters: the processor maker's adapter (Intel 0x8086,
+/// AMD 0x1002) with the least dedicated memory. Every other real adapter is a discrete card.
+pub fn integrated_index(adapters: &[AdapterInfo], cpu_name: &str) -> Option<usize> {
+    let l = cpu_name.to_lowercase();
+    let vendor = if l.contains("intel") || l.contains("core") {
+        0x8086
+    } else if l.contains("amd") || l.contains("ryzen") {
+        0x1002
+    } else {
+        return None;
+    };
+    adapters.iter().enumerate().filter(|(_, a)| a.vendor_id == vendor).min_by_key(|(_, a)| a.dedicated).map(|(i, _)| i)
+}
+
+/// The discrete cards: every real adapter that is not the chip's own graphics. Windows can list
+/// one chip more than once (same vendor and device ID, another LUID): that is still one chip.
+pub fn discrete_indices(adapters: &[AdapterInfo], cpu_name: &str) -> Vec<usize> {
+    let igpu = integrated_index(adapters, cpu_name);
+    let own = igpu.map(|i| (adapters[i].vendor_id, adapters[i].device_id));
+    let mut seen: Vec<(u32, u32)> = Vec::new();
+    let mut out = Vec::new();
+    for (i, a) in adapters.iter().enumerate() {
+        let id = (a.vendor_id, a.device_id);
+        if Some(id) == own || is_virtual(a) || seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        out.push(i);
+    }
+    out
+}
+
+/// Software and virtual adapters (Microsoft Basic Render, remote / virtual displays).
+pub fn is_virtual(a: &AdapterInfo) -> bool {
+    a.vendor_id == 0x1414 || a.name.to_lowercase().contains("virtual") || a.name.contains("Basic Render")
+}
+
+/// Power state (0..3 for D0..D3) of each display device as (vendor, device) from Windows' own
+/// device data: asks the driver stack nothing, so a sleeping GPU stays asleep.
+pub fn power_states() -> Vec<(u32, u32, u8)> {
+    use windows::core::GUID;
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDevicePropertyW, DIGCF_PRESENT, SP_DEVINFO_DATA};
+    use windows::Win32::Devices::Properties::{DEVPROPKEY, DEVPROPTYPE};
+    const DISPLAY: GUID = GUID::from_u128(0x4d36e968_e325_11ce_bfc1_08002be10318);
+    // DEVPKEY_Device_HardwareIds and DEVPKEY_Device_PowerData (CM_POWER_DATA)
+    const HWIDS: DEVPROPKEY = DEVPROPKEY { fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0), pid: 3 };
+    const POWER: DEVPROPKEY = DEVPROPKEY { fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0), pid: 32 };
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(set) = SetupDiGetClassDevsW(Some(&DISPLAY), None, None, DIGCF_PRESENT) else { return out };
+        let mut i = 0;
+        loop {
+            let mut info = SP_DEVINFO_DATA { cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32, ..Default::default() };
+            if SetupDiEnumDeviceInfo(set, i, &mut info).is_err() {
+                break;
+            }
+            i += 1;
+            let mut ty = DEVPROPTYPE(0);
+            let mut ids = [0u8; 1024];
+            let mut got = 0u32;
+            if SetupDiGetDevicePropertyW(set, &info, &HWIDS, &mut ty, Some(&mut ids), Some(&mut got), 0).is_err() {
+                continue;
+            }
+            let w: Vec<u16> = ids[..got as usize].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let first = String::from_utf16_lossy(&w).split('\0').next().unwrap_or_default().to_uppercase();
+            let hex = |key: &str| first.find(key).and_then(|p| u32::from_str_radix(first.get(p + key.len()..p + key.len() + 4)?, 16).ok());
+            let (Some(ven), Some(dev)) = (hex("VEN_"), hex("DEV_")) else { continue };
+            // CM_POWER_DATA: PD_Size, then PD_MostRecentPowerState (1 = D0 .. 4 = D3)
+            let mut pd = [0u8; 64];
+            if SetupDiGetDevicePropertyW(set, &info, &POWER, &mut ty, Some(&mut pd), None, 0).is_err() {
+                continue;
+            }
+            let state = i32::from_le_bytes([pd[4], pd[5], pd[6], pd[7]]);
+            if (1..=4).contains(&state) {
+                out.push((ven, dev, (state - 1) as u8));
+            }
+        }
+        let _ = SetupDiDestroyDeviceInfoList(set);
+    }
+    out
 }
 
 impl AdapterInfo {
@@ -91,6 +175,7 @@ impl Gpu {
                     perf: Default::default(),
                     dedicated_used: None,
                     shared_used: None,
+                    d_state: None,
                 });
                 g.handles.push(a.cast::<IDXGIAdapter3>().ok());
             }
@@ -162,7 +247,19 @@ impl Gpu {
     /// last one. GPU popup only; `stop_perf` lets the thread sleep again.
     pub fn update_perf(&mut self) {
         let Some(i) = self.primary else { return };
-        let a = &self.adapters[i];
+        self.update_perf_for(i);
+    }
+
+    /// Power states read elsewhere (the controls thread).
+    pub fn set_power_states(&mut self, states: &[(u32, u32, u8)]) {
+        for a in &mut self.adapters {
+            a.d_state = states.iter().find(|(v, d, _)| *v == a.vendor_id && *d == a.device_id).map(|s| s.2);
+        }
+    }
+
+    /// Sensors of adapter `i`, as `update_perf`.
+    pub fn update_perf_for(&mut self, i: usize) {
+        let Some(a) = self.adapters.get(i) else { return };
         let target = Target { luid: a.luid, vendor_id: a.vendor_id, name: a.name.clone() };
         let luids: Vec<u64> = self.adapters.iter().map(|a| a.luid).collect();
         let worker = self.worker.get_or_insert_with(|| SensorWorker::start(luids));
@@ -265,5 +362,32 @@ fn sensor_loop(st: std::sync::Arc<(std::sync::Mutex<SensorState>, std::sync::Con
         s.result = Some((luid, perf));
         // next reading in a second, or at once when the adapter changes
         let _ = cv.wait_timeout_while(s, std::time::Duration::from_secs(1), |s| s.want.as_ref() == Some(&target)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod power_state_tests {
+    fn ad(name: &str, vendor_id: u32, device_id: u32, dedicated: u64, luid: u64) -> super::AdapterInfo {
+        super::AdapterInfo { name: name.into(), vendor_id, device_id, dedicated, driver: String::new(), luid, enabled: true, load: None, perf: Default::default(), dedicated_used: None, shared_used: None, d_state: None }
+    }
+
+    #[test]
+    fn one_chip_listed_twice_is_no_graphics_card() {
+        let cpu = "Intel(R) Core(TM) Ultra 9 285H";
+        // the Arc 140T twice (two LUIDs), no card: nothing discrete
+        let a = [ad("Intel(R) Arc(TM) 140T GPU", 0x8086, 0x7d51, 128 << 20, 1), ad("Intel(R) Arc(TM) 140T GPU", 0x8086, 0x7d51, 128 << 20, 2)];
+        assert!(super::discrete_indices(&a, cpu).is_empty());
+        // with a GeForce (listed twice too) and the basic renderer: the GeForce once
+        let b = [ad("Intel(R) UHD Graphics", 0x8086, 0xa788, 128 << 20, 1), ad("NVIDIA GeForce RTX 4090 Laptop GPU", 0x10de, 0x2757, 16 << 30, 2), ad("NVIDIA GeForce RTX 4090 Laptop GPU", 0x10de, 0x2757, 16 << 30, 3), ad("Microsoft Basic Render Driver", 0x1414, 0x8c, 0, 4)];
+        assert_eq!(super::discrete_indices(&b, "13th Gen Intel(R) Core(TM) i9-13900HX"), vec![1]);
+        // an Intel Arc card next to Intel graphics: another device ID, so a card
+        let c = [ad("Intel(R) Graphics", 0x8086, 0x7d55, 128 << 20, 1), ad("Intel(R) Arc(TM) A770M", 0x8086, 0x5690, 16 << 30, 2)];
+        assert_eq!(super::discrete_indices(&c, cpu), vec![1]);
+    }
+
+    #[test]
+    #[ignore]
+    fn print_power_states() {
+        println!("{:x?}", super::power_states());
     }
 }
