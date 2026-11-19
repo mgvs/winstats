@@ -96,6 +96,10 @@ pub struct Config {
     pub net_chart_tx: bool,
     /// Host the network popup pings for the latency and jitter rows; empty switches it off.
     pub ping_host: String,
+    /// A second host pinged alongside the first (empty = none).
+    pub ping_host2: String,
+    /// The user's own DNS servers for the network popup's "Custom" choice, comma separated.
+    pub dns_custom: String,
     /// Listen for winstats-agent beacons on the network (Remote menu).
     pub discovery: bool,
     /// Remote machines by key; widgets refer to them as "<key>/<widget>".
@@ -177,6 +181,8 @@ impl Default for Config {
             net_chart_rx: true,
             net_chart_tx: true,
             ping_host: "1.1.1.1".into(),
+            ping_host2: String::new(),
+            dns_custom: String::new(),
             discovery: false,
             remotes: BTreeMap::new(),
             share: false,

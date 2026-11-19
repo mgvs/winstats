@@ -291,6 +291,7 @@ fn column(ui: &mut Ui, x: i32, w: i32, top: i32, f: &dyn Fn(&mut Ui)) -> i32 {
             anim_bg: Vec::new(),
             phase: ui.phase,
             max_rows: None,
+            ping_edit: None,
             flipped: ui.flipped,
             fold_open: false,
             fold: Vec::new(),
@@ -1777,7 +1778,7 @@ mod tests {
                         sleeps: vec![crate::metrics::sleepdrain::SleepEvent { from: 1_700_000_000, to: 1_700_033_000, pct_from: 0.81, pct_to: 0.77, mwh_from: Some(58_300), mwh_to: Some(55_400) }],
                         ..Default::default()
                     };
-                    let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: None, copied: None, anim: None, anim_bg: Vec::new(), phase: 0.4, max_rows: None, flipped: Box::leak(Box::new(std::collections::HashSet::new())), fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
+                    let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: None, copied: None, anim: None, anim_bg: Vec::new(), phase: 0.4, max_rows: None, ping_edit: None, flipped: Box::leak(Box::new(std::collections::HashSet::new())), fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
                     draw(&mut ui, &m);
                     // a second redraw of the same popup: what each second costs once it is open
                     let y_was = ui.y;
@@ -1838,7 +1839,7 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 c.resize(w, h);
                 c.clear();
-                let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: Some((300 + i * 40, 200)), copied: None, anim: None, anim_bg: Vec::new(), phase: 0.0, max_rows: None, flipped: &flipped, fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
+                let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: Some((300 + i * 40, 200)), copied: None, anim: None, anim_bg: Vec::new(), phase: 0.0, max_rows: None, ping_edit: None, flipped: &flipped, fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
                 chart_page(&mut ui, &m, 520.0);
                 times.push(t0.elapsed().as_secs_f64() * 1000.0);
             }

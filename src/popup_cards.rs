@@ -110,7 +110,7 @@ mod style_tests {
                     let mut icons = crate::procicon::IconCache::default();
                     let (mut locks, mut frozen) = (Vec::new(), None);
                     let expanded = std::collections::HashSet::new();
-                    let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: None, copied: None, anim: None, anim_bg: Vec::new(), phase: 0.4, max_rows: None, flipped: Box::leak(Box::new(std::collections::HashSet::new())), fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
+                    let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: None, copied: None, anim: None, anim_bg: Vec::new(), phase: 0.4, max_rows: None, ping_edit: None, flipped: Box::leak(Box::new(std::collections::HashSet::new())), fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
                     if kind == 0 {
                         battery_view::draw(&mut ui, &m.data);
                     } else {

@@ -3,6 +3,7 @@ pub mod battery;
 pub mod controls;
 pub mod cpu;
 pub mod disks;
+pub mod dns;
 pub mod displays;
 pub mod drives;
 pub mod emi;
@@ -78,6 +79,22 @@ pub struct MetricsData {
     /// ms, from the ICMP probe while the popup is open
     pub net_latency: Option<f32>,
     pub net_jitter: Option<f32>,
+    /// the second ping target and its readings (empty = none)
+    pub net_ping_host2: String,
+    pub net_latency2: Option<f32>,
+    pub net_jitter2: Option<f32>,
+    /// DNS of the active interface (local, read while the network popup is open)
+    pub dns: Option<dns::DnsState>,
+    /// a DNS change is being applied (elevated command running)
+    pub dns_busy: bool,
+    /// the user's own servers for the Custom choice (from the config)
+    pub dns_custom: String,
+    /// DNS response times (ms, None = no answer), measured when the network popup opens
+    pub dns_speed: Vec<(std::net::IpAddr, Option<f32>)>,
+    /// that measurement is still going
+    pub dns_speed_running: bool,
+    /// DNS is intercepted on this network (an address without a server answered)
+    pub dns_intercepted: Option<bool>,
     /// WinStats keeps the PC and screen awake
     pub keep_awake: bool,
     /// screen-off timeouts of the power plan, seconds (on AC, on battery)
