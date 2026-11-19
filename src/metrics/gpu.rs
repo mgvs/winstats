@@ -516,7 +516,12 @@ mod power_state_tests {
     #[test]
     fn this_processor_is_known() {
         let v = super::cpu_graphics_vendor();
-        assert!(v == Some(0x8086) || v == Some(0x1002), "{v:x?}");
+        // x86 machines are Intel or AMD; on ARM (Snapdragon) there is no CPUID to ask
+        if cfg!(target_arch = "x86_64") {
+            assert!(v == Some(0x8086) || v == Some(0x1002), "{v:x?}");
+        } else {
+            assert_eq!(v, None);
+        }
     }
 
     #[test]

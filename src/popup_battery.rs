@@ -1880,7 +1880,7 @@ mod tests {
         let (mut locks, mut frozen) = (Vec::new(), None);
         let expanded = std::collections::HashSet::new();
         let flipped = std::collections::HashSet::new();
-        let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: None, copied: None, anim: None, anim_bg: Vec::new(), phase: 0.0, max_rows: None, flipped: &flipped, fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
+        let mut ui = Ui { c: &mut c, t: &theme, w, y: 0, hover: None, pie: None, tips: Vec::new(), hits: Vec::new(), icons: &mut icons, indent: 0, locks: &mut locks, frozen: &mut frozen, expanded: &expanded, proc_filter: (true, true), mem_bar: false, gpu_by_vram: false, charts: Vec::new(), last_chart: (0, 0, 0, 0), ages: (0.0, 1.0), mouse: None, copied: None, anim: None, anim_bg: Vec::new(), phase: 0.0, max_rows: None, ping_edit: None, flipped: &flipped, fold_open: false, fold: Vec::new(), order: &[], drag: None, frows: Vec::new() };
         draw(&mut ui, &m);
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("previews");
         std::fs::create_dir_all(&out).unwrap();

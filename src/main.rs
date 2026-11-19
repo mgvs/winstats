@@ -724,9 +724,11 @@ impl App {
             self.metrics.dns = metrics::dns::read(&self.metrics.net_iface);
             self.metrics.dns_custom = self.cfg.dns_custom.clone();
         }
-        // DNS response times: once per opening (and every 2 min while it stays open), the server
-        // in use first, then the presets, then the user's own
-        if net_open && (!self.net_was_open || self.dns_bench.started.map_or(true, |t| t.elapsed().as_secs() >= 120)) {
+        // DNS response times: only while the DNS list is open (they send queries to the public
+        // resolvers), once per opening and every 2 min while it stays open; the server in use
+        // first, then the presets, then the user's own
+        let dns_open = net_open && self.popup.visible && self.popup.source.is_none() && self.popup.is_expanded("dns");
+        if dns_open && (!self.net_was_open || self.dns_bench.started.map_or(true, |t| t.elapsed().as_secs() >= 120)) {
             use std::net::IpAddr;
             let mut list: Vec<IpAddr> = Vec::new();
             if let Some(d) = self.metrics.dns.as_ref() {
@@ -742,7 +744,7 @@ impl App {
             list.retain(|ip| if seen.contains(ip) { false } else { seen.push(*ip); true });
             self.dns_bench.start(list);
         }
-        self.net_was_open = net_open;
+        self.net_was_open = dns_open;
         let bench = self.dns_bench.snapshot();
         self.metrics.dns_speed = bench.times;
         self.metrics.dns_speed_running = bench.running;

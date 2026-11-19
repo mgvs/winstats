@@ -673,6 +673,11 @@ impl Popup {
     }
 
     /// Open or close an expandable block.
+    /// An expandable block is open ("dns": the DNS list of the network popup).
+    pub fn is_expanded(&self, key: &str) -> bool {
+        self.expanded.contains(key)
+    }
+
     pub fn toggle_expand(&mut self, key: String) {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
