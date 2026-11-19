@@ -24,7 +24,7 @@ Click a widget for its popup (the Network one shows the tooltip that opens over 
 The battery of a remote MacBook through its agent, plugged in but drawing on its battery for the moment: where the
 power goes, the pack's readings and the history (in Russian; on the strip the battery widget in its compact layout):
 
-<img src="docs/popup-battery-remote.png" alt="Battery popup of a remote MacBook" width="560">
+<p align="center"><img src="docs/popup-battery-remote.png" alt="Battery popup of a remote MacBook" width="460"></p>
 
 Right click for the settings menu. The interface comes in 29 languages (see Configuration); the menu in
 English and Ukrainian, the popups in Greek and Ukrainian:
