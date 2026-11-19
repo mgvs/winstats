@@ -179,7 +179,7 @@ fn log_path() -> std::path::PathBuf {
     crate::util::config_dir().join("power_log.csv")
 }
 
-const LOG_HEADER: &str = "unix,on_ac,remote,console,valid,level,rate_w,batt_w,pkg_w,pp0_w,pp1_w,dram_w,platform_w,brightness,external,panels,lit0,lit1,est_w,est_err_w,status,n,pkg_avg_w\n";
+const LOG_HEADER: &str = "unix,on_ac,remote,console,valid,level,rate_w,batt_w,pkg_w,pp0_w,pp1_w,dram_w,platform_w,brightness,external,panels,lit0,lit1,est_w,est_err_w,status,n,pkg_avg_w,dgpu_awake\n";
 /// the log rolls over to power_log.1.csv at this size
 const LOG_MAX: u64 = 20 * 1024 * 1024;
 
@@ -193,7 +193,8 @@ fn save_model(m: &super::powermodel::Model) {
     }
 }
 
-fn log_row(t: &Telemetry, ds: &super::displays::DisplayState, valid: bool, lit: &[Option<Option<f32>>; super::powermodel::SLOTS], batt_w: Option<f32>, est: Option<(f32, Option<f32>)>, model: &super::powermodel::Model) {
+/// `dgpu`: None = no discrete card, else whether one is awake.
+fn log_row(t: &Telemetry, ds: &super::displays::DisplayState, valid: bool, lit: &[Option<Option<f32>>; super::powermodel::SLOTS], batt_w: Option<f32>, est: Option<(f32, Option<f32>)>, model: &super::powermodel::Model, dgpu: Option<bool>) {
     if !PERSIST {
         return;
     }
@@ -207,7 +208,11 @@ fn log_row(t: &Telemetry, ds: &super::displays::DisplayState, valid: bool, lit: 
     CHECKED.call_once(|| {
         let first = std::fs::read_to_string(&path).ok().and_then(|t| t.lines().next().map(str::to_string));
         if first.map_or(false, |l| l != LOG_HEADER.trim_end()) {
-            let _ = std::fs::rename(&path, crate::util::config_dir().join("power_log.v1.csv"));
+            // the first free power_log.vN.csv: an older set-aside log is kept too
+            let dir = crate::util::config_dir();
+            if let Some(to) = (1..100).map(|n| dir.join(format!("power_log.v{n}.csv"))).find(|p| !p.exists()) {
+                let _ = std::fs::rename(&path, to);
+            }
         }
     });
     let new = !path.exists();
@@ -224,7 +229,7 @@ fn log_row(t: &Telemetry, ds: &super::displays::DisplayState, valid: bool, lit: 
         Some(a) => o(a),
     };
     let row = format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\"{}\",{},{},{},{},{},{},{}\n",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\"{}\",{},{},{},{},{},{},{},{}\n",
         t.at_unix,
         t.on_ac.map_or("", |a| if a { "1" } else { "0" }),
         ds.remote as u8,
@@ -248,6 +253,7 @@ fn log_row(t: &Telemetry, ds: &super::displays::DisplayState, valid: bool, lit: 
         model.status(),
         model.n,
         o(t.meters_avg.iter().find(|m| m.role == MeterRole::CpuPackage).map(|m| m.watts)),
+        dgpu.map_or("", |a| if a { "1" } else { "0" }),
     );
     let _ = f.write_all(row.as_bytes());
 }
@@ -274,9 +280,15 @@ fn model_step(model: &mut super::powermodel::Model, t: &Telemetry) -> Option<(f3
     }
     let batt_w = if on_battery { t.platform_watts().or_else(|| t.rate_mw().filter(|r| *r < -250).map(|r| -r as f32 / 1000.0)) } else { None };
     let pkg_w = t.meters.iter().find(|m| m.role == MeterRole::CpuPackage).map(|m| m.watts);
-    let obs = Obs { at: t.at_unix, on_battery, valid, battery_w: batt_w, pkg_w, brightness: ds.brightness.unwrap_or(100) as f32 / 100.0, lit };
+    // a discrete card awake draws outside the model's terms (on many gaming notebooks the
+    // external ports hang off it, so an external screen keeps it awake): read from Windows'
+    // device data, which leaves a sleeping card asleep
+    static IGPU_VENDOR: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let cards = super::gpu::discrete_states(&super::gpu::power_states(), *IGPU_VENDOR.get_or_init(super::gpu::cpu_graphics_vendor));
+    let dgpu = (!cards.is_empty()).then(|| cards.iter().any(|c| c.2));
+    let obs = Obs { at: t.at_unix, on_battery, valid, battery_w: batt_w, pkg_w, brightness: ds.brightness.unwrap_or(100) as f32 / 100.0, lit, dgpu_awake: dgpu == Some(true) };
     let est = model.observe(obs);
-    log_row(t, &ds, valid, &lit, batt_w, est, model);
+    log_row(t, &ds, valid, &lit, batt_w, est, model, dgpu);
     est
 }
 

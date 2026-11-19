@@ -61,6 +61,26 @@ pub fn discrete_indices(adapters: &[AdapterInfo], cpu_name: &str) -> Vec<usize> 
     out
 }
 
+/// For each adapter, the earlier entry it repeats. Hybrid notebooks can list one chip twice
+/// (same vendor and device ID, another LUID); two cards of one model sit on different PCI
+/// buses and stay apart. An unknown bus counts as the same chip.
+pub fn twins(adapters: &[AdapterInfo], bus: &dyn Fn(u64) -> Option<u32>) -> Vec<Option<usize>> {
+    let mut out: Vec<Option<usize>> = vec![None; adapters.len()];
+    for i in 0..adapters.len() {
+        let b = &adapters[i];
+        out[i] = (0..i).filter(|&k| out[k].is_none()).find(|&k| {
+            let a = &adapters[k];
+            a.vendor_id == b.vendor_id
+                && a.device_id == b.device_id
+                && match (bus(a.luid), bus(b.luid)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => true,
+                }
+        });
+    }
+    out
+}
+
 /// Software and virtual adapters (Microsoft Basic Render, remote / virtual displays).
 pub fn is_virtual(a: &AdapterInfo) -> bool {
     a.vendor_id == 0x1414 || a.name.to_lowercase().contains("virtual") || a.name.contains("Basic Render")
@@ -111,6 +131,49 @@ pub fn power_states() -> Vec<(u32, u32, u8)> {
     out
 }
 
+/// PCI vendor of the processor's own graphics, from CPUID: Intel 0x8086, AMD 0x1002. None on
+/// other processors (ARM, or an unknown maker).
+pub fn cpu_graphics_vendor() -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // CPUID leaf 0: the vendor string in EBX, EDX, ECX
+        #[allow(unused_unsafe)]
+        let r = unsafe { std::arch::x86_64::__cpuid(0) };
+        let mut v = Vec::with_capacity(12);
+        for reg in [r.ebx, r.edx, r.ecx] {
+            v.extend_from_slice(&reg.to_le_bytes());
+        }
+        match &v[..] {
+            b"GenuineIntel" => Some(0x8086),
+            b"AuthenticAMD" => Some(0x1002),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
+}
+
+/// The display devices of another maker than the processor's graphics (the discrete cards),
+/// once per (vendor, device), with whether each is awake (D0). Same-maker cards (an Arc card
+/// next to Intel graphics) are not told apart here. Empty when the processor is unknown.
+pub fn discrete_states(states: &[(u32, u32, u8)], igpu_vendor: Option<u32>) -> Vec<(u32, u32, bool)> {
+    let Some(own) = igpu_vendor else { return Vec::new() };
+    let mut out: Vec<(u32, u32, bool)> = Vec::new();
+    for &(ven, dev, d) in states {
+        if ven == own || ven == 0x1414 {
+            continue;
+        }
+        match out.iter_mut().find(|(v, dv, _)| *v == ven && *dv == dev) {
+            // one chip listed twice: awake if either entry is
+            Some(e) => e.2 |= d == 0,
+            None => out.push((ven, dev, d == 0)),
+        }
+    }
+    out
+}
+
 impl AdapterInfo {
     pub fn vendor(&self) -> &'static str {
         match self.vendor_id {
@@ -130,6 +193,8 @@ impl AdapterInfo {
 pub struct Gpu {
     /// DXGI handle of each entry in `adapters`, for the VRAM usage of the primary one
     handles: Vec<Option<IDXGIAdapter3>>,
+    /// (LUID of a listed adapter, LUID of its repeat): the counters of both count for it
+    alias: Vec<(u64, u64)>,
     primary: Option<usize>,
     /// sensor thread, started on the first GPU popup
     worker: Option<SensorWorker>,
@@ -142,7 +207,7 @@ pub struct Gpu {
 
 impl Gpu {
    pub fn new(disabled: &[String]) -> Self {
-        let mut g = Self { handles: Vec::new(), primary: None, worker: None, name: String::new(), vram_total: 0, vram_used: 0, vram_budget: 0, adapters: Vec::new() };
+        let mut g = Self { handles: Vec::new(), alias: Vec::new(), primary: None, worker: None, name: String::new(), vram_total: 0, vram_used: 0, vram_budget: 0, adapters: Vec::new() };
         unsafe {
             let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return g };
             let mut i = 0;
@@ -180,8 +245,40 @@ impl Gpu {
                 g.handles.push(a.cast::<IDXGIAdapter3>().ok());
             }
         }
+        g.merge_twins();
         g.set_disabled(disabled);
         g
+    }
+
+    /// One row per chip: a repeated entry is dropped and its LUID kept as an alias.
+    fn merge_twins(&mut self) {
+        let a = &self.adapters;
+        let same = |i: usize, k: usize| a[i].vendor_id == a[k].vendor_id && a[i].device_id == a[k].device_id;
+        let cand: Vec<u64> = (0..a.len()).filter(|&i| (0..a.len()).any(|k| k != i && same(i, k))).map(|i| a[i].luid).collect();
+        if cand.is_empty() {
+            return;
+        }
+        // kernel adapter handles for the bus numbers only; closed again on drop
+        let kmt = super::gpuperf::GpuPerf::new(&cand);
+        let tw = twins(a, &|l| kmt.as_ref().and_then(|p| p.bus(l)));
+        drop(kmt);
+        for i in (0..tw.len()).rev() {
+            if let Some(k) = tw[i] {
+                self.alias.push((self.adapters[k].luid, self.adapters[i].luid));
+                self.adapters.remove(i);
+                self.handles.remove(i);
+            }
+        }
+    }
+
+    /// Every LUID, repeats included (for the counter sources).
+    pub fn all_luids(&self) -> Vec<u64> {
+        self.adapters.iter().map(|a| a.luid).chain(self.alias.iter().map(|x| x.1)).collect()
+    }
+
+    /// The LUIDs whose counters belong to the adapter with this LUID.
+    fn luids_of(&self, luid: u64) -> impl Iterator<Item = u64> + '_ {
+        std::iter::once(luid).chain(self.alias.iter().filter(move |x| x.0 == luid).map(|x| x.1))
     }
 
     /// Switch adapters off by name (at least one stays on) and pick the primary among the rest.
@@ -220,8 +317,9 @@ impl Gpu {
             return None;
         }
         let mut best: Option<f32> = None;
-        for a in self.adapters.iter_mut() {
-            let v = loads.get(&a.luid).cloned();
+        for i in 0..self.adapters.len() {
+            let v = self.luids_of(self.adapters[i].luid).filter_map(|l| loads.get(&l).cloned()).reduce(f32::max);
+            let a = &mut self.adapters[i];
             a.load = Some(v.unwrap_or(0.0));
             if let (true, Some(v)) = (a.enabled, v) {
                 best = Some(best.map_or(v, |b| b.max(v)));
@@ -234,8 +332,11 @@ impl Gpu {
     /// Memory in use per adapter from the GPU Adapter Memory counters (by LUID).
     /// An adapter missing from one sample keeps its last figures, so the row does not blink.
     pub fn set_adapter_mem(&mut self, mem: &std::collections::HashMap<u64, (u64, u64)>) {
-        for a in self.adapters.iter_mut() {
-            if let Some(m) = mem.get(&a.luid) {
+        for i in 0..self.adapters.len() {
+            // a repeat's memory is the same memory: take the larger figure, not the sum
+            let m = self.luids_of(self.adapters[i].luid).filter_map(|l| mem.get(&l).cloned()).reduce(|x, y| (x.0.max(y.0), x.1.max(y.1)));
+            if let Some(m) = m {
+                let a = &mut self.adapters[i];
                 a.dedicated_used = Some(m.0);
                 a.shared_used = Some(m.1);
             }
@@ -261,7 +362,7 @@ impl Gpu {
     pub fn update_perf_for(&mut self, i: usize) {
         let Some(a) = self.adapters.get(i) else { return };
         let target = Target { luid: a.luid, vendor_id: a.vendor_id, name: a.name.clone() };
-        let luids: Vec<u64> = self.adapters.iter().map(|a| a.luid).collect();
+        let luids = self.all_luids();
         let worker = self.worker.get_or_insert_with(|| SensorWorker::start(luids));
         let (m, cv) = &*worker.st;
         let mut st = m.lock().unwrap();
@@ -386,8 +487,43 @@ mod power_state_tests {
     }
 
     #[test]
+    fn a_chip_listed_twice_is_one_row() {
+        // a hybrid notebook: Intel UHD, the GeForce, Intel UHD again under another LUID
+        let a = [ad("Intel(R) UHD Graphics", 0x8086, 0xa788, 128 << 20, 1), ad("NVIDIA GeForce RTX 4090 Laptop GPU", 0x10de, 0x2757, 16 << 30, 2), ad("Intel(R) UHD Graphics", 0x8086, 0xa788, 128 << 20, 3)];
+        // both Intel entries on bus 0, the GeForce on bus 1
+        let bus = |l: u64| Some(if l == 2 { 1 } else { 0 });
+        assert_eq!(super::twins(&a, &bus), vec![None, None, Some(0)]);
+        // bus unknown (no kernel handle): still the same chip
+        assert_eq!(super::twins(&a, &|_| None), vec![None, None, Some(0)]);
+        // two cards of one model on their own buses: both stay
+        let b = [ad("NVIDIA GeForce RTX 4090", 0x10de, 0x2684, 24 << 30, 1), ad("NVIDIA GeForce RTX 4090", 0x10de, 0x2684, 24 << 30, 2)];
+        assert_eq!(super::twins(&b, &|l| Some(l as u32)), vec![None, None]);
+    }
+
+    #[test]
+    fn discrete_states_by_maker() {
+        // Intel UHD awake, the GeForce asleep (listed twice), the basic renderer ignored
+        let s = [(0x8086, 0xa788, 0), (0x10de, 0x2757, 3), (0x10de, 0x2757, 3), (0x1414, 0x8c, 0)];
+        assert_eq!(super::discrete_states(&s, Some(0x8086)), vec![(0x10de, 0x2757, false)]);
+        // one of the two entries awake: awake
+        let s = [(0x8086, 0xa788, 0), (0x10de, 0x2757, 3), (0x10de, 0x2757, 0)];
+        assert_eq!(super::discrete_states(&s, Some(0x8086)), vec![(0x10de, 0x2757, true)]);
+        // only the chip's own graphics, or an unknown processor: nothing
+        assert!(super::discrete_states(&[(0x8086, 0x7d51, 0)], Some(0x8086)).is_empty());
+        assert!(super::discrete_states(&s, None).is_empty());
+    }
+
+    #[test]
+    fn this_processor_is_known() {
+        let v = super::cpu_graphics_vendor();
+        assert!(v == Some(0x8086) || v == Some(0x1002), "{v:x?}");
+    }
+
+    #[test]
     #[ignore]
     fn print_power_states() {
-        println!("{:x?}", super::power_states());
+        let s = super::power_states();
+        println!("{:x?}", s);
+        println!("igpu vendor {:x?}, discrete {:x?}", super::cpu_graphics_vendor(), super::discrete_states(&s, super::cpu_graphics_vendor()));
     }
 }
