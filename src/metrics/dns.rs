@@ -110,13 +110,19 @@ pub fn run_elevated(cmd: &str) -> Option<isize> {
         nShow: SW_HIDE.0,
         ..Default::default()
     };
-    unsafe {
-        if ShellExecuteExW(&mut info).is_err() || info.hProcess.is_invalid() {
+    // SHELLEXECUTEINFOW is packed on 32-bit Windows: the handle is copied out before use
+    let process = unsafe {
+        if ShellExecuteExW(&mut info).is_err() {
             crate::log!("dns: elevated command not started (declined?)");
             return None;
         }
+        info.hProcess
+    };
+    if process.is_invalid() {
+        crate::log!("dns: elevated command not started (declined?)");
+        return None;
     }
-    Some(info.hProcess.0 as isize)
+    Some(process.0 as isize)
 }
 
 /// Wait for the elevated process; its exit code (0 = done).

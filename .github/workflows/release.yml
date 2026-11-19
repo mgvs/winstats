@@ -42,7 +42,9 @@ jobs:
       - name: Build winstats and the agent
         run: |
           cargo build --release --target ${{ matrix.target }}
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --release --target ${{ matrix.target }} -p winstats-agent
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Stage release binaries
         shell: pwsh
