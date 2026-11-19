@@ -237,6 +237,9 @@ pub fn draw(ui: &mut Ui, m: &MetricsData) {
         }
         if local {
             standby_section(ui, m);
+        }
+        // a remote machine's history is what came while it was connected
+        if local || !m.power_history.is_empty() {
             history(ui, &m.power_history, tel.at_unix, false, full_wh, (64.0, 72.0));
         }
     });
@@ -246,6 +249,8 @@ pub fn draw(ui: &mut Ui, m: &MetricsData) {
             quick_section(ui, m);
             ui.space(6.0);
             link(ui, &t("power.open_settings"), "ms-settings:powersleep");
+        }
+        if local || !m.power_history.is_empty() {
             draw_history(ui, &m.power_history, tel.at_unix, false, 136.0);
         }
     });
@@ -909,6 +914,9 @@ fn readings(ui: &mut Ui, tel: &Telemetry, local: bool) {
             SourceKind::Usb => t("power.source_usb"),
             SourceKind::Wireless => t("power.source_wireless"),
         };
+        if let Some(w) = tel.source_w {
+            text.push_str(&format!(" \u{00B7} {w} W"));
+        }
         if let Some(ma) = max_ma {
             text.push_str(&format!(" \u{00B7} {}", tf("power.max_current", &[("a", &format!("{:.2}", ma as f32 / 1000.0))])));
         }

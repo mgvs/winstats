@@ -1,6 +1,6 @@
 [package]
 name = "winstats-proto"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.77"
 description = "Wire types shared by winstats and winstats-agent"

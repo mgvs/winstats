@@ -34,6 +34,11 @@ pub fn read_battery(root: &Root) -> Option<BatterySample> {
         full_wh,
         design_wh: wh("energy_full_design", "charge_full_design"),
         cycles: n("cycle_count").filter(|c| *c > 0).map(|c| c as u32),
+        voltage_mv: volts.map(|v| (v * 1000.0).round() as u32),
+        // tenths of a degree, where the driver has a sensor
+        temp_c: read_num(&bat.join("temp")).map(|t| t as f32 / 10.0).filter(|c| (-20.0..90.0).contains(c)),
+        adapter_w: None,
+        adapter_ma: None,
     })
 }
 

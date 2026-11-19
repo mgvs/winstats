@@ -153,6 +153,8 @@ pub struct Telemetry {
     /// seconds of battery left, Windows' own estimate while discharging
     pub remaining_secs: Option<u32>,
     pub source: Option<(SourceKind, Option<u32>)>,
+    /// the charger's rating, W, where the machine reports it (a Mac through its agent)
+    pub source_w: Option<u32>,
     pub meters: Vec<MeterChannel>,
     /// the same channels averaged over `METER_AVG_SECS`, to set against the gauge's rate
     pub meters_avg: Vec<MeterChannel>,

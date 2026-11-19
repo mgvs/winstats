@@ -8,6 +8,7 @@ extern "C" {
     fn IOPSCopyPowerSourcesInfo() -> CFTypeRef;
     fn IOPSCopyPowerSourcesList(blob: CFTypeRef) -> CFTypeRef;
     fn IOPSGetPowerSourceDescription(blob: CFTypeRef, ps: CFTypeRef) -> CFTypeRef;
+    fn IOPSCopyExternalPowerAdapterDetails() -> CFTypeRef;
 }
 
 pub fn read() -> Option<BatterySample> {
@@ -26,6 +27,9 @@ pub fn read() -> Option<BatterySample> {
         let remaining_secs = if on_ac { None } else { int(get(d, "Time to Empty")).filter(|m| *m > 0).map(|m| m as u32 * 60) };
         let mut b = BatterySample { level: (cur / max).clamp(0.0, 1.0), charging, on_ac, remaining_secs, ..Default::default() };
         smart(&mut b);
+        if on_ac {
+            adapter(&mut b);
+        }
         return Some(b);
     }
     None
@@ -46,7 +50,17 @@ fn smart(b: &mut BatterySample) {
     b.full_wh = wh(num("AppleRawMaxCapacity").or_else(|| num("FullChargeCapacity")));
     b.design_wh = wh(num("DesignCapacity"));
     b.cycles = num("CycleCount").filter(|c| *c >= 0).map(|c| c as u32);
+    b.voltage_mv = Some(mv as u32);
+    // hundredths of a degree; a plausible pack temperature only
+    b.temp_c = num("Temperature").map(|t| t as f32 / 100.0).filter(|c| (-20.0..90.0).contains(c));
     // mA, signed: negative while discharging (a 64-bit wrap on some models)
     let ma = num("InstantAmperage").filter(|a| *a != 0).or_else(|| num("Amperage")).map(|a| a as i32);
     b.rate_w = ma.map(|a| a as f32 * v / 1000.0);
+}
+
+/// The charger plugged in, as macOS describes it: its rating and the current it allows.
+fn adapter(b: &mut BatterySample) {
+    let Some(d) = Cf::new(unsafe { IOPSCopyExternalPowerAdapterDetails() }) else { return };
+    b.adapter_w = int(get(d.0, "Watts")).filter(|w| *w > 0 && *w < 1000).map(|w| w as u32);
+    b.adapter_ma = int(get(d.0, "Current")).filter(|a| *a > 0 && *a < 20_000).map(|a| a as u32);
 }

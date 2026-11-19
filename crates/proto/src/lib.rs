@@ -292,6 +292,17 @@ pub struct BatterySample {
     pub design_wh: Option<f32>,
     #[serde(default)]
     pub cycles: Option<u32>,
+    /// the pack's voltage, mV (agent 0.3.2+)
+    #[serde(default)]
+    pub voltage_mv: Option<u32>,
+    /// the pack's temperature, °C (agent 0.3.2+)
+    #[serde(default)]
+    pub temp_c: Option<f32>,
+    /// the charger plugged in: its rating, W, and the most current it allows, mA (agent 0.3.2+)
+    #[serde(default)]
+    pub adapter_w: Option<u32>,
+    #[serde(default)]
+    pub adapter_ma: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

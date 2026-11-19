@@ -144,6 +144,7 @@ fn snapshot_from(d: &MetricsData, seq: u64) -> Snapshot {
                 full_wh: wh(det.max_mwh),
                 design_wh: wh(det.design_mwh),
                 cycles: det.cycles,
+                ..Default::default()
             }
         }),
         temp: d.cpu_temp.map(|c| vec![TempSample { id: "CPU Package".into(), c }]).unwrap_or_default(),

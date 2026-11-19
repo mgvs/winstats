@@ -262,6 +262,8 @@ pub struct Agent {
     pub visible: bool,
     /// drawn in grey: no data for `STALE_SECS`, not yet gone
     pub stale: bool,
+    /// unix seconds of the last battery history point
+    hist_at: u64,
     /// when the link went down, for the popup
     pub offline_since: Option<Instant>,
     net_disabled: Vec<String>,
@@ -294,6 +296,7 @@ impl Agent {
             stale: false,
             offline_since: None,
             addr_since: Instant::now(),
+            hist_at: 0,
             net_disabled: cfg.net_disabled.clone(),
             disks_disabled: cfg.disks_disabled.clone(),
             last_sample: None,
@@ -552,6 +555,25 @@ impl Agent {
         d.load_avg = s.load.clone();
         d.fans = s.fans.iter().map(|f| Fan { id: f.id.clone(), rpm: f.rpm, duty: f.duty }).collect();
         d.power = s.power.iter().map(|p| Power { id: p.id.clone(), w: p.w }).collect();
+        // the battery popup's readings and history, as for this machine
+        match s.battery.as_ref() {
+            Some(b) => {
+                let tel = battery_telemetry(b, &s.power);
+                if tel.at_unix >= self.hist_at + metrics::power::HIST_STEP {
+                    self.hist_at = tel.at_unix;
+                    let flow = metrics::powerflow::flow(&tel);
+                    let point = metrics::power::HistPoint { at: tel.at_unix, level: b.level, watts: flow.system.value().unwrap_or(f32::NAN), split: metrics::powerflow::split(&tel) };
+                    let h = std::sync::Arc::make_mut(&mut d.power_history);
+                    h.push(point);
+                    if h.len() > metrics::power::HIST_LEN {
+                        let extra = h.len() - metrics::power::HIST_LEN;
+                        h.drain(..extra);
+                    }
+                }
+                d.power_tel = Some(std::sync::Arc::new(tel));
+            }
+            None => d.power_tel = None,
+        }
     }
 
     fn apply_details(&mut self, det: Details) {
@@ -799,6 +821,50 @@ impl Remotes {
             Some(a) if a.online => crate::i18n::t("remote.online"),
             _ => crate::i18n::t("remote.offline"),
         }
+    }
+}
+
+/// What an agent says about its battery, as the battery popup takes it: the pack, the charger,
+/// and the machine's draw ("System" on a Mac) as the platform meter, which lets the popup work
+/// out the adapter, battery and system flows; the CPU's own draw as the package meter.
+fn battery_telemetry(b: &winstats_proto::BatterySample, power: &[winstats_proto::PowerSample]) -> metrics::power::Telemetry {
+    use metrics::power::{Cell, MeterChannel, MeterRole, SourceKind, Telemetry};
+    let mwh = |wh: Option<f32>| wh.filter(|v| *v > 0.0).map(|v| (v * 1000.0) as u32);
+    let rate_mw = b.rate_w.map(|w| (w * 1000.0) as i32);
+    let cell = Cell {
+        capacity_mwh: mwh(b.remaining_wh),
+        full_mwh: mwh(b.full_wh),
+        design_mwh: mwh(b.design_wh),
+        voltage_mv: b.voltage_mv,
+        rate_mw,
+        cycles: b.cycles,
+        temp_c: b.temp_c,
+        charging: b.charging,
+        discharging: rate_mw.map_or(!b.on_ac, |r| r < 0),
+        on_line: b.on_ac,
+        ..Default::default()
+    };
+    let meters = power
+        .iter()
+        .filter_map(|p| {
+            let role = match p.id.as_str() {
+                "System" => MeterRole::Platform,
+                "CPU" => MeterRole::CpuPackage,
+                _ => return None,
+            };
+            Some(MeterChannel { name: p.id.clone(), watts: p.w, role })
+        })
+        .collect();
+    Telemetry {
+        at_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        cells: vec![cell],
+        level: Some(b.level),
+        on_ac: Some(b.on_ac),
+        remaining_secs: b.remaining_secs,
+        source: b.on_ac.then_some((SourceKind::Ac, b.adapter_ma)),
+        source_w: b.adapter_w.filter(|_| b.on_ac),
+        meters,
+        ..Default::default()
     }
 }
 

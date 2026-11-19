@@ -109,6 +109,12 @@ impl Smc {
         self.read("PSTR").filter(|w| *w > 0.0 && *w < 2000.0).map(|w| w as f32)
     }
 
+    /// The battery pack's temperature ("TB0T".."TB2T"): Apple silicon keeps it out of the
+    /// battery's own properties.
+    pub fn battery_temp(&self) -> Option<f32> {
+        ["TB0T", "TB1T", "TB2T"].iter().find_map(|k| self.read(k)).filter(|c| *c > -20.0 && *c < 90.0).map(|c| c as f32)
+    }
+
     /// Intel graphics through PECI ("TCGC") or the GPU diode ("TG0D", "TG0P").
     pub fn gpu_temp(&self) -> Option<f32> {
         ["TCGC", "TG0D", "TG0P"].iter().find_map(|k| self.read(k)).filter(|c| *c > 0.0 && *c < 150.0).map(|c| c as f32)

@@ -1,6 +1,6 @@
 [package]
 name = "winstats-agent"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.77"
 description = "Broadcasts this machine's resource usage to winstats on the local network"

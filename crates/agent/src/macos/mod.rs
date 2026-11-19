@@ -257,6 +257,12 @@ impl Mac {
 
     pub fn sample(&mut self) -> MacSample {
         let mut out = MacSample { battery: battery::read(), disk: self.disk.as_mut().and_then(|d| d.activity()), ..Default::default() };
+        // the pack's temperature from SMC where the battery does not say it
+        if let (Some(b), Some(smc)) = (out.battery.as_mut(), self.smc.as_ref()) {
+            if b.temp_c.is_none() {
+                b.temp_c = smc.battery_temp();
+            }
+        }
         let reading = self.ior.as_mut().map(|r| r.sample());
         if let (Some(r), Some(ior)) = (&reading, &self.ior) {
             if self.core_cluster.iter().all(|c| c.is_some()) {
