@@ -21,8 +21,10 @@ Click a widget for its popup (the Network one shows the tooltip that opens over 
 |---|---|---|
 | ![Disk popup](docs/popup-disk.png) | ![GPU popup](docs/popup-gpu.png) | ![CPU popup of an ARM node](docs/popup-remote-cpu.png) |
 
-The battery of a remote MacBook through its agent, plugged in but drawing on its battery for the moment: where the
-power goes, the pack's readings and the history (in Russian; on the strip the battery widget in its compact layout):
+The battery module is the work of [@harafuhub](https://github.com/harafuhub), thanks a lot
+([#11](https://github.com/mgvs/winstats/pull/11))! Here it shows a remote MacBook through its agent, plugged in but
+drawing on its battery for the moment: where the power goes, the pack's readings and the history (in Russian; on the
+strip the battery widget in its compact layout):
 
 <p align="center"><img src="docs/popup-battery-remote.png" alt="Battery popup of a remote MacBook" width="460"></p>
 
