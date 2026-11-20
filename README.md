@@ -425,3 +425,6 @@ cpu = "green"
 
 Oleksandr Zhabotynskyi <alexlp@mgvs.org>. MIT. The look follows [Stats](https://github.com/exelban/stats) (MIT);
 no code from it is used.
+
+Thanks to everyone who has contributed to winstats: see the
+[contributors](https://github.com/mgvs/winstats/graphs/contributors).
