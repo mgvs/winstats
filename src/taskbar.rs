@@ -12,7 +12,7 @@ use windows::Win32::UI::Accessibility::{
 use windows::core::{BSTR, Interface, VARIANT};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayDevicesW, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow, DISPLAY_DEVICEW,
+    EnumDisplayDevicesW, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow, DISPLAY_DEVICEW, DISPLAY_DEVICE_ACTIVE,
     MONITORINFOEXW, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -55,7 +55,20 @@ fn describe_display(tray: HWND) -> Option<DisplayTaskbar> {
         if !GetMonitorInfoW(handle, &mut info.monitorInfo).as_bool() {
             return None;
         }
-        let _ = EnumDisplayDevicesW(PCWSTR(info.szDevice.as_ptr()), 0, &mut monitor, EDD_GET_DEVICE_INTERFACE_NAME);
+        // Disconnected monitors can precede the active one on the same GDI
+        // source. Never use a stale monitor's identity for the current taskbar.
+        let mut index = 0;
+        loop {
+            let mut device = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+            if !EnumDisplayDevicesW(PCWSTR(info.szDevice.as_ptr()), index, &mut device, EDD_GET_DEVICE_INTERFACE_NAME).as_bool() {
+                break;
+            }
+            if device.StateFlags & DISPLAY_DEVICE_ACTIVE != 0 {
+                monitor = device;
+                break;
+            }
+            index += 1;
+        }
     }
     let source = wide_string(&info.szDevice);
     let device_id = wide_string(&monitor.DeviceID);
@@ -387,6 +400,18 @@ impl Taskbar {
 #[cfg(test)]
 mod tests {
     use super::strip_start;
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop with taskbars"]
+    fn live_display_identity() {
+        let displays = super::displays();
+        assert!(!displays.is_empty(), "no taskbars available");
+        for display in displays {
+            println!("{}: {}", display.label, display.id);
+            assert_eq!(super::target(&display.id), Some(display.tray),
+                "saved display identity must select its own taskbar");
+        }
+    }
 
     #[test]
     fn strip_respects_native_or_measured_boundary() {
